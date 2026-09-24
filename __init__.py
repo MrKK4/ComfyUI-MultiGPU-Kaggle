@@ -13,6 +13,7 @@ import comfy.memory_management
 import comfy.model_patcher
 import comfy.sample as comfy_sample
 from nodes import NODE_CLASS_MAPPINGS as GLOBAL_NODE_CLASS_MAPPINGS
+from .kitchen_turing_fix import patch_comfy_kitchen_turing
 from .device_utils import (
     get_device_list,
     is_accelerator_available,
@@ -590,6 +591,7 @@ mm.unet_offload_device = unet_offload_device_patched
 _patch_model_management_current_stream()
 _patch_comfy_sample_runtime_device()
 _patch_comfy_kitchen_dlpack_device_guard()
+patch_comfy_kitchen_turing()
 _initialize_aimdo_visible_cuda_devices()
 
 from .nodes import (
