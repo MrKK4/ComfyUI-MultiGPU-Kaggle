@@ -38,6 +38,8 @@ HEAD = 128
 DEVICES = (torch.device("cuda:0"), torch.device("cuda:1"))
 _SHARD_CACHE = {}
 CHUNKS = max(1, int(os.environ.get("MMH3_TP_CHUNKS", "4")))
+# next block's norm1 + qkv for finished chunks, queued behind the last mlp exchange of this block
+QKV_PREFETCH = os.environ.get("MMH3_TP_QKV_PREFETCH", "1") != "0"
 
 
 def _record(dev, stream=None):
@@ -191,10 +193,13 @@ class H3TensorParallel:
         self.qk_eps = blk.attn.q_norm.eps
         self.checked = os.environ.get("MMH3_TP_CHECK", "0") != "1"
 
-    def _attn(self, x, sh, shift, scale, segs, rope, topts):
+    def _qkv(self, x, sh, shift, scale, segs):
         h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm1"], self.eps1), shift, scale, segs).to(torch.float16)
-        s, heads = h.shape[0], sh["heads"]
-        q, k, v = _lin(h, sh["qkv"]).split(sh["inner"], dim=-1)
+        return _lin(h, sh["qkv"])
+
+    def _attn(self, qkv, sh, rope, topts):
+        s, heads = qkv.shape[0], sh["heads"]
+        q, k, v = qkv.split(sh["inner"], dim=-1)
         v = v.view(s, heads, HEAD)
         q = q.view(1, s, heads, HEAD)
         k = k.view(1, s, heads, HEAD)
@@ -209,6 +214,12 @@ class H3TensorParallel:
         a = _lin(h, sh["fc1"])
         a[..., a.shape[-1] // 2:].mul_(1.0 / S)
         return _lin(a, sh["fc2"], act="swiglu")
+
+    def _mods(self, i, t_emb):
+        mods0 = self.blocks[i].adaln_proj(t_emb)
+        with torch.cuda.device(DEVICES[1]):
+            mods1 = [m.to(DEVICES[1], non_blocking=True) for m in mods0]
+        return mods0, mods1
 
     def _step_state(self, x0, args):
         """Per-forward replicas on cuda:1, rebuilt when a new forward starts (block 0)."""
@@ -236,15 +247,21 @@ class H3TensorParallel:
         st = self._step_state(args["img"], args)
         x1, segs0, segs1, topts = st["x1"], args["mod_segments"], st["segs1"], args["transformer_options"]
         sh0, sh1 = self.shards[0][i], self.shards[1][i]
-        mods0 = blk.adaln_proj(args["t_emb"])
-        with torch.cuda.device(d1):
-            mods1 = [m.to(d1, non_blocking=True) for m in mods0]
+        pre = st.pop("pre", None)
+        if pre is not None and pre[0] == i:
+            _, mods0, mods1, qkv = pre
+        else:
+            mods0, mods1 = self._mods(i, args["t_emb"])
+            qkv = None
         ref = None
         if not self.checked:
             ref = original({**args, "img": args["img"].clone()})["img"].float()
 
         xs, shs, mods, segs = (x0, x1), (sh0, sh1), (mods0, mods1), (segs0, segs1)
-        os_ = _per_rank(lambda r: self._attn(xs[r], shs[r], mods[r][0], mods[r][1], segs[r], st["rope%d" % r], topts))
+        if qkv is None:
+            qkv = _per_rank(lambda r: self._qkv(xs[r], shs[r], mods[r][0], mods[r][1], segs[r]))
+        os_ = _per_rank(lambda r: self._attn(qkv[r], shs[r], st["rope%d" % r], topts))
+        del qkv
         # per-token tail pipelined in row chunks: out_proj -> swap -> gate -> mlp -> swap -> gate
         n = x0.shape[0]
         shape, size = (n, x0.shape[1]), -(-n // CHUNKS)
@@ -268,10 +285,23 @@ class H3TensorParallel:
                 return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r])
             own_m.append(_per_rank(attn_then_mlp))
             sent_m.append(self.xchg.send("mlp", shape, (a, b), own_m[j]))
+        nxt = i + 1 if QKV_PREFETCH and i + 1 < len(self.blocks) and ref is None else None
+        if nxt is not None:
+            nmods = self._mods(nxt, args["t_emb"])
+            nsh = (self.shards[0][nxt], self.shards[1][nxt])
+            nqkv = _per_rank(lambda r: torch.empty((n, 3 * nsh[r]["inner"]), dtype=torch.float16, device=DEVICES[r]))
         for j, (a, b) in enumerate(chunks):
             got = self.xchg.recv("mlp", shape, (a, b), sent_m[j])
-            _per_rank(lambda r: h3._mod_gate(xs[r][a:b], mods[r][5], (own_m[j][r] + got[r]).float() * S, csegs[j][r]))
+
+            def gate_then_next_qkv(r):
+                xc = xs[r][a:b]
+                h3._mod_gate(xc, mods[r][5], (own_m[j][r] + got[r]).float() * S, csegs[j][r])
+                if nxt is not None:
+                    nqkv[r][a:b] = self._qkv(xc, nsh[r], nmods[r][0], nmods[r][1], csegs[j][r])
+            _per_rank(gate_then_next_qkv)
             own_m[j] = None
+        if nxt is not None:
+            st["pre"] = (nxt, nmods[0], nmods[1], nqkv)
 
         if ref is not None:
             self.checked = True
