@@ -48,7 +48,8 @@ def _record(dev, stream=None):
 
 class _ChunkedExchange:
     """Row-parallel partial sums swapped chunk by chunk through pinned host buffers on side copy
-    streams. Buffers persist per (phase, shape); events guard their reuse by the next block."""
+    streams. Pinned buffers persist per (phase, shape), events guard their reuse by the next block;
+    device-side receives are chunk-sized temporaries (VRAM is full with the shards)."""
 
     def __init__(self):
         self.copy = None
@@ -60,9 +61,7 @@ class _ChunkedExchange:
         key = (phase, shape)
         if key not in self.bufs:
             self.bufs[key] = {"host": [torch.empty(shape, dtype=dtype, pin_memory=True) for _ in DEVICES],
-                              "recv": [torch.empty(shape, dtype=dtype, device=d) for d in DEVICES],
-                              "read": [None, None],  # rank r's copy stream finished reading host[1-r]
-                              "used": [None, None]}  # rank r's compute finished with recv[r]
+                              "read": [None, None]}  # rank r's copy stream finished reading host[1-r]
         return self.bufs[key]
 
     def send(self, phase, shape, rows, parts):
@@ -89,22 +88,17 @@ class _ChunkedExchange:
             with torch.cuda.device(dev):
                 cs = self.copy[r]
                 cs.wait_event(sent[1 - r])
-                if a == 0 and buf["used"][r] is not None:
-                    cs.wait_event(buf["used"][r])
                 with torch.cuda.stream(cs):
-                    buf["recv"][r][a:b].copy_(buf["host"][1 - r][a:b], non_blocking=True)
+                    dst = torch.empty((b - a,) + shape[1:], dtype=buf["host"][0].dtype, device=dev)
+                    dst.copy_(buf["host"][1 - r][a:b], non_blocking=True)
                 ev = _record(dev, cs)
                 if b == shape[0]:
                     buf["read"][r] = ev
-                torch.cuda.current_stream(dev).wait_event(ev)
-                out.append(buf["recv"][r][a:b])
+                compute = torch.cuda.current_stream(dev)
+                compute.wait_event(ev)
+                dst.record_stream(compute)
+                out.append(dst)
         return out
-
-    def done(self, phase, shape):
-        buf = self.bufs[(phase, shape)]
-        for r, dev in enumerate(DEVICES):
-            with torch.cuda.device(dev):
-                buf["used"][r] = _record(dev)
 
 
 def _chunk_segs(segs, a, b):
@@ -262,12 +256,10 @@ class H3TensorParallel:
                 return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r])
             own_m.append(_per_rank(attn_then_mlp))
             sent_m.append(self.xchg.send("mlp", shape, (a, b), own_m[j]))
-        self.xchg.done("attn", shape)
         for j, (a, b) in enumerate(chunks):
             got = self.xchg.recv("mlp", shape, (a, b), sent_m[j])
             _per_rank(lambda r: h3._mod_gate(xs[r][a:b], mods[r][5], (own_m[j][r] + got[r]).float() * S, csegs[j][r]))
             own_m[j] = None
-        self.xchg.done("mlp", shape)
 
         if ref is not None:
             self.checked = True
