@@ -32,7 +32,8 @@ def _clips(vae, z):
 def _decode_on(helper, clip_z, home, out, err):
     try:
         dev = helper.device
-        with torch.cuda.device(dev):
+        # grad mode is thread-local: ComfyUI runs nodes under inference_mode on its own thread only
+        with torch.inference_mode(), torch.cuda.device(dev):
             dec = helper.first_stage_model._adaptive_decode(clip_z.to(dev))
             out.append(dec.to(home))
             torch.cuda.synchronize(dev)
