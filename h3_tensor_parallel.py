@@ -57,7 +57,9 @@ class _ChunkedExchange:
 
     def _buf(self, phase, shape, dtype=torch.float16):
         if self.copy is None:
-            self.copy = [torch.cuda.Stream(d) for d in DEVICES]
+            # MMH3_TP_SIDE_STREAMS=0 keeps the copies on the compute streams (no overlap; A/B knob)
+            side = os.environ.get("MMH3_TP_SIDE_STREAMS", "1") != "0"
+            self.copy = [torch.cuda.Stream(d) if side else torch.cuda.current_stream(d) for d in DEVICES]
         key = (phase, shape)
         if key not in self.bufs:
             self.bufs[key] = {"host": [torch.empty(shape, dtype=dtype, pin_memory=True) for _ in DEVICES],
