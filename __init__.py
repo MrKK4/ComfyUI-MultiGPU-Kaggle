@@ -15,6 +15,7 @@ import comfy.model_patcher
 import comfy.sample as comfy_sample
 from nodes import NODE_CLASS_MAPPINGS as GLOBAL_NODE_CLASS_MAPPINGS
 from .kitchen_turing_fix import patch_comfy_kitchen_turing
+from .h3_mixed_precision import patch_minimax_h3_mixed_precision
 from .device_utils import (
     get_device_list,
     is_accelerator_available,
@@ -599,6 +600,7 @@ _patch_model_management_current_stream()
 _patch_comfy_sample_runtime_device()
 _patch_comfy_kitchen_dlpack_device_guard()
 patch_comfy_kitchen_turing()
+patch_minimax_h3_mixed_precision()
 _initialize_aimdo_visible_cuda_devices()
 
 from .nodes import (
