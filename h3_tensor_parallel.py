@@ -17,7 +17,9 @@ import os
 import torch
 from safetensors import safe_open
 
+import comfy.cli_args
 import comfy.model_management
+import comfy.model_prefetch
 import comfy.patcher_extension
 import comfy.quant_ops
 import comfy.rmsnorm
@@ -179,7 +181,9 @@ class H3TensorParallel:
     def block(self, i, args, original):
         d0, d1 = DEVICES
         if self.shards is None:
-            self.shards = _load_shards(self.path, len(self.blocks))
+            # permanent allocations: keep them out of the compiler's per-forward allocation graph
+            with comfy.model_prefetch.pause_malloc_graph(sync=True):
+                self.shards = _load_shards(self.path, len(self.blocks))
         blk = self.blocks[i]
         x0 = args["img"].float()
         st = self._step_state(args["img"], args)
@@ -242,6 +246,8 @@ class UNETLoaderH3TensorParallel:
         dm = model.model.diffusion_model
         if not isinstance(dm, h3.MiniMaxH3Model):
             raise ValueError("UNETLoaderH3TensorParallel only supports MiniMax H3 checkpoints")
+        # the Comfy compiler records one device's allocations per forward; TP allocates on two
+        comfy.cli_args.args.disable_comfy_compiler = True
         tp = H3TensorParallel(path, dm)
         for i in range(len(dm.blocks)):
             model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
