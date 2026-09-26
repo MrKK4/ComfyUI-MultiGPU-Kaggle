@@ -11,10 +11,25 @@ import threading
 import torch
 
 import comfy.ldm.minimax.vae as hv
+import comfy.memory_management
 import comfy.model_management
 
 logger = logging.getLogger("MultiGPU")
 _orig_decode_temporal = hv.MiniMaxH3VideoVAE.decode_temporal
+
+# ComfyUI locks each weight file, but the helper VAE is a second handle on the same file and
+# aimdo's file reader is shared: "HostBuffer.read_file_slice failed" when both decode threads
+# stream weights at once. One process-wide lock serializes only the reads; compute stays parallel.
+_READ_LOCK = threading.RLock()
+_orig_read = comfy.memory_management.read_tensor_file_slice_into
+
+
+def _locked_read(*args, **kwargs):
+    with _READ_LOCK:
+        return _orig_read(*args, **kwargs)
+
+
+comfy.memory_management.read_tensor_file_slice_into = _locked_read
 
 
 def _clips(vae, z):
