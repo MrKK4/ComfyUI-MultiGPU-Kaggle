@@ -11,26 +11,14 @@ import threading
 import torch
 
 import comfy.ldm.minimax.vae as hv
-import comfy.memory_management
 import comfy.model_management
+import comfy.model_patcher
+import comfy.sd
+import comfy.utils
+import folder_paths
 
 logger = logging.getLogger("MultiGPU")
 _orig_decode_temporal = hv.MiniMaxH3VideoVAE.decode_temporal
-
-# ComfyUI locks each weight file, but the helper VAE is a second handle on the same file and
-# aimdo's file reader is shared: "HostBuffer.read_file_slice failed" when both decode threads
-# stream weights at once. One process-wide lock serializes only the reads; compute stays parallel.
-_READ_LOCK = threading.RLock()
-_orig_read = comfy.memory_management.read_tensor_file_slice_into
-
-
-def _locked_read(*args, **kwargs):
-    with _READ_LOCK:
-        return _orig_read(*args, **kwargs)
-
-
-comfy.memory_management.read_tensor_file_slice_into = _locked_read
-
 
 def _clips(vae, z):
     # mirrors decode_temporal's padding and clip slicing
@@ -88,28 +76,49 @@ def decode_temporal(self, z, output_buffer=None):
 hv.MiniMaxH3VideoVAE.decode_temporal = decode_temporal
 
 
+_HELPERS = {}
+
+
+def _helper(vae_name, device):
+    """Plain, fully resident copy of the VAE on `device`. A dynamic-VRAM copy streams its weights
+    from the file inside the decode thread, which fails ("HostBuffer.read_file_slice failed")."""
+    key = (vae_name, str(device))
+    if key not in _HELPERS:
+        sd, metadata = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("vae", vae_name), return_metadata=True)
+        dynamic = comfy.model_patcher.CoreModelPatcher
+        comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcher
+        try:
+            _HELPERS[key] = comfy.sd.VAE(sd=sd, device=torch.device(device), metadata=metadata)
+        finally:
+            comfy.model_patcher.CoreModelPatcher = dynamic
+        logger.info("[MultiGPU] H3 helper VAE resident on %s", device)
+    return _HELPERS[key]
+
+
 class VAEDecodeH3DualGPU:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"samples": ("LATENT",), "vae": ("VAE",), "helper_vae": ("VAE",)}}
+        return {"required": {"samples": ("LATENT",), "vae": ("VAE",),
+                             "helper_vae_name": (folder_paths.get_filename_list("vae"),),
+                             "helper_device": (["cuda:0", "cuda:1"],)}}
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "decode"
     CATEGORY = "multigpu"
-    DESCRIPTION = "MiniMax H3 video decode split over two GPUs: helper_vae is the same VAE file loaded on the other device."
+    DESCRIPTION = "MiniMax H3 video decode split over two GPUs: helper_vae_name is the same VAE file, kept resident on helper_device."
 
-    def decode(self, samples, vae, helper_vae):
+    def decode(self, samples, vae, helper_vae_name, helper_device):
         latent = samples["samples"]
         if latent.is_nested:
             latent = latent.unbind()[0]
         fsm = vae.first_stage_model
-        usable = isinstance(fsm, hv.MiniMaxH3VideoVAE) and torch.device(helper_vae.device) != torch.device(vae.device) and latent.ndim == 5 and latent.shape[2] > 1
+        usable = isinstance(fsm, hv.MiniMaxH3VideoVAE) and torch.device(helper_device) != torch.device(vae.device) and latent.ndim == 5 and latent.shape[2] > 1
         if usable:
-            comfy.model_management.load_models_gpu(
-                [helper_vae.patcher], memory_required=helper_vae.memory_used_decode(latent.shape, helper_vae.vae_dtype))
-            fsm._mmh3_helper = helper_vae
+            helper = _helper(helper_vae_name, helper_device)
+            comfy.model_management.load_models_gpu([helper.patcher], force_full_load=True)
+            fsm._mmh3_helper = helper
         else:
-            logger.info("[MultiGPU] VAEDecodeH3DualGPU: single-device decode (not H3 video, or helper on the same device)")
+            logger.info("[MultiGPU] VAEDecodeH3DualGPU: single-device decode (not H3 video, or helper on the VAE's device)")
         try:
             images = vae.decode(latent)
         finally:
