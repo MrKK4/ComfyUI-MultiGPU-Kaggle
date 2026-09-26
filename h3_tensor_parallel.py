@@ -250,6 +250,7 @@ class H3TensorParallel:
         for a, b in chunks:
             own_a.append(_per_rank(lambda r: _lin(os_[r][a:b] * (1.0 / S), shs[r]["out"])))
             sent_a.append(self.xchg.send("attn", shape, (a, b), own_a[-1]))
+        del os_
         own_m, sent_m = [], []
         for j, (a, b) in enumerate(chunks):
             got = self.xchg.recv("attn", shape, (a, b), sent_a[j])
@@ -257,6 +258,7 @@ class H3TensorParallel:
             def attn_then_mlp(r):
                 xc = xs[r][a:b]
                 h3._mod_gate(xc, mods[r][2], (own_a[j][r] + got[r]).float() * S, csegs[j][r])
+                own_a[j][r] = None
                 return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r])
             own_m.append(_per_rank(attn_then_mlp))
             sent_m.append(self.xchg.send("mlp", shape, (a, b), own_m[j]))
@@ -264,6 +266,7 @@ class H3TensorParallel:
         for j, (a, b) in enumerate(chunks):
             got = self.xchg.recv("mlp", shape, (a, b), sent_m[j])
             _per_rank(lambda r: h3._mod_gate(xs[r][a:b], mods[r][5], (own_m[j][r] + got[r]).float() * S, csegs[j][r]))
+            own_m[j] = None
         self.xchg.done("mlp", shape)
 
         if ref is not None:
@@ -283,18 +286,6 @@ def _no_block_prefetch(executor, *args, **kwargs):
     return executor(*args, **kwargs)
 
 
-def _no_compiler(executor, *args, **kwargs):
-    # the Comfy compiler records one device's allocations per forward; TP allocates on two.
-    # H3 opens its malloc graph before DIFFUSION_MODEL wrappers run, so toggle at APPLY_MODEL.
-    # ponytail: process-global flag, fine while ComfyUI runs one prompt at a time
-    prev = comfy.cli_args.args.disable_comfy_compiler
-    comfy.cli_args.args.disable_comfy_compiler = True
-    try:
-        return executor(*args, **kwargs)
-    finally:
-        comfy.cli_args.args.disable_comfy_compiler = prev
-
-
 class UNETLoaderH3TensorParallel:
     @classmethod
     def INPUT_TYPES(s):
@@ -312,10 +303,12 @@ class UNETLoaderH3TensorParallel:
         dm = model.model.diffusion_model
         if not isinstance(dm, h3.MiniMaxH3Model):
             raise ValueError("UNETLoaderH3TensorParallel only supports MiniMax H3 checkpoints")
+        # the Comfy compiler records one device's allocations per forward; TP allocates on two.
+        # ponytail: process-wide, Split in the same session runs without the compiler
+        comfy.cli_args.args.disable_comfy_compiler = True
         tp = H3TensorParallel(path, dm)
         for i in range(len(dm.blocks)):
             model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
                                           "dit", "double_block", i)
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "mmh3_tp", _no_block_prefetch)
-        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.APPLY_MODEL, "mmh3_tp", _no_compiler)
         return (model,)
