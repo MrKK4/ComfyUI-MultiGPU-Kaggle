@@ -3,7 +3,9 @@
 Every DiT block is split Megatron-style: qkv_proj / fc1 by output rows (half the heads and
 half the MLP width per GPU), out_proj / fc2 by input columns. Each GPU keeps a replica of the
 fp32 residual stream; the two row-parallel partial sums are exchanged through pinned host
-buffers, chained with CUDA events so neither GPU waits on the host. Shards come straight from
+buffers in row chunks on side copy streams, so the PCIe round trip of one chunk hides behind
+the compute of the next (MMH3_TP_CHUNKS, default 4; per-row int8 activation quant keeps the
+chunked math identical). Shards come straight from
 the int8 convrot checkpoint (splits land on multiples of the 256 rotation group) and stay
 resident on both GPUs; the model's own block weights are never paged in.
 
@@ -35,50 +37,92 @@ S = 64.0
 HEAD = 128
 DEVICES = (torch.device("cuda:0"), torch.device("cuda:1"))
 _SHARD_CACHE = {}
+CHUNKS = max(1, int(os.environ.get("MMH3_TP_CHUNKS", "4")))
 
 
-class _HostAllReduce:
-    """p0 (cuda:0) + p1 (cuda:1) on both devices, via a two-slot ring of pinned buffers."""
+def _record(dev, stream=None):
+    ev = torch.cuda.Event()
+    ev.record(stream if stream is not None else torch.cuda.current_stream(dev))
+    return ev
+
+
+class _ChunkedExchange:
+    """Row-parallel partial sums swapped chunk by chunk through pinned host buffers on side copy
+    streams. Buffers persist per (phase, shape); events guard their reuse by the next block."""
 
     def __init__(self):
-        self.slots = {}
-        self.turn = {}
+        self.copy = None
+        self.bufs = {}
 
-    def __call__(self, p0, p1):
-        d0, d1 = DEVICES
-        key = tuple(p0.shape)
-        if key not in self.slots:
-            self.slots[key] = [{"h0": torch.empty(key, dtype=p0.dtype, pin_memory=True),
-                                "h1": torch.empty(key, dtype=p1.dtype, pin_memory=True),
-                                "read0": None, "read1": None} for _ in range(2)]
-            self.turn[key] = 0
-        slot = self.slots[key][self.turn[key]]
-        self.turn[key] ^= 1
-        s0, s1 = torch.cuda.current_stream(d0), torch.cuda.current_stream(d1)
-        # a slot's buffers may still be read by the previous exchange that used it
-        if slot["read1"] is not None:
-            s0.wait_event(slot["read1"])
-        if slot["read0"] is not None:
-            s1.wait_event(slot["read0"])
-        with torch.cuda.device(d0):
-            slot["h0"].copy_(p0, non_blocking=True)
-            sent0 = torch.cuda.Event()
-            sent0.record(s0)
-        with torch.cuda.device(d1):
-            slot["h1"].copy_(p1, non_blocking=True)
-            sent1 = torch.cuda.Event()
-            sent1.record(s1)
-        with torch.cuda.device(d0):
-            s0.wait_event(sent1)
-            r0 = p0 + slot["h1"].to(d0, non_blocking=True)
-            slot["read0"] = torch.cuda.Event()
-            slot["read0"].record(s0)
-        with torch.cuda.device(d1):
-            s1.wait_event(sent0)
-            r1 = p1 + slot["h0"].to(d1, non_blocking=True)
-            slot["read1"] = torch.cuda.Event()
-            slot["read1"].record(s1)
-        return r0, r1
+    def _buf(self, phase, shape, dtype=torch.float16):
+        if self.copy is None:
+            self.copy = [torch.cuda.Stream(d) for d in DEVICES]
+        key = (phase, shape)
+        if key not in self.bufs:
+            self.bufs[key] = {"host": [torch.empty(shape, dtype=dtype, pin_memory=True) for _ in DEVICES],
+                              "recv": [torch.empty(shape, dtype=dtype, device=d) for d in DEVICES],
+                              "read": [None, None],  # rank r's copy stream finished reading host[1-r]
+                              "used": [None, None]}  # rank r's compute finished with recv[r]
+        return self.bufs[key]
+
+    def send(self, phase, shape, rows, parts):
+        """D2H of parts[r] (rank r's partial for `rows`) into host[r]; returns the copy-done events."""
+        a, b = rows
+        buf, sent = self._buf(phase, shape, parts[0].dtype), []
+        for r, dev in enumerate(DEVICES):
+            with torch.cuda.device(dev):
+                cs = self.copy[r]
+                cs.wait_event(_record(dev))
+                if a == 0 and buf["read"][1 - r] is not None:
+                    cs.wait_event(buf["read"][1 - r])
+                with torch.cuda.stream(cs):
+                    buf["host"][r][a:b].copy_(parts[r], non_blocking=True)
+                parts[r].record_stream(cs)
+                sent.append(_record(dev, cs))
+        return sent
+
+    def recv(self, phase, shape, rows, sent):
+        """H2D of the other rank's rows; returns per-rank views, ready on each compute stream."""
+        a, b = rows
+        buf, out = self._buf(phase, shape), []
+        for r, dev in enumerate(DEVICES):
+            with torch.cuda.device(dev):
+                cs = self.copy[r]
+                cs.wait_event(sent[1 - r])
+                if a == 0 and buf["used"][r] is not None:
+                    cs.wait_event(buf["used"][r])
+                with torch.cuda.stream(cs):
+                    buf["recv"][r][a:b].copy_(buf["host"][1 - r][a:b], non_blocking=True)
+                ev = _record(dev, cs)
+                if b == shape[0]:
+                    buf["read"][r] = ev
+                torch.cuda.current_stream(dev).wait_event(ev)
+                out.append(buf["recv"][r][a:b])
+        return out
+
+    def done(self, phase, shape):
+        buf = self.bufs[(phase, shape)]
+        for r, dev in enumerate(DEVICES):
+            with torch.cuda.device(dev):
+                buf["used"][r] = _record(dev)
+
+
+def _chunk_segs(segs, a, b):
+    """mod_segments restricted to rows [a, b), rebased to a."""
+    out = []
+    for sa, sb, row in segs:
+        lo, hi = max(sa, a), min(sb, b)
+        if lo < hi:
+            out.append((lo - a, hi - a, row[lo - sa:hi - sa] if torch.is_tensor(row) and row.dim() else row))
+    return out
+
+
+def _per_rank(fn):
+    out = []
+    for r, dev in enumerate(DEVICES):
+        with torch.cuda.device(dev):
+            out.append(fn(r))
+    return out
 
 
 def _rows(t, chunk, part, rank):
@@ -137,7 +181,7 @@ class H3TensorParallel:
         self.path = path
         self.blocks = diffusion_model.blocks
         self.shards = None
-        self.allreduce = _HostAllReduce()
+        self.xchg = _ChunkedExchange()
         blk = self.blocks[0]
         self.eps1, self.eps2 = blk.norm1.eps, blk.norm2.eps
         self.qk_eps = blk.attn.q_norm.eps
@@ -154,8 +198,7 @@ class H3TensorParallel:
         q = AttentionTensorContainer(q[0].transpose(0, 1).unsqueeze(0))
         k = AttentionTensorContainer(k[0].transpose(0, 1).unsqueeze(0))
         v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
-        o = optimized_attention(q, k, v, heads, mask=None, skip_reshape=True, transformer_options=topts)
-        return _lin(o.squeeze(0) * (1.0 / S), sh["out"])
+        return optimized_attention(q, k, v, heads, mask=None, skip_reshape=True, transformer_options=topts).squeeze(0)
 
     def _mlp(self, x, sh, shift, scale, segs):
         h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm2"], self.eps2), shift, scale, segs).to(torch.float16)
@@ -196,21 +239,32 @@ class H3TensorParallel:
         if not self.checked:
             ref = original({**args, "img": args["img"].clone()})["img"].float()
 
-        a0 = self._attn(x0, sh0, mods0[0], mods0[1], segs0, st["rope0"], topts)
-        with torch.cuda.device(d1):
-            a1 = self._attn(x1, sh1, mods1[0], mods1[1], segs1, st["rope1"], topts)
-        r0, r1 = self.allreduce(a0, a1)
-        x0 = h3._mod_gate(x0, mods0[2], r0.float() * S, segs0)
-        with torch.cuda.device(d1):
-            x1 = h3._mod_gate(x1, mods1[2], r1.float() * S, segs1)
+        xs, shs, mods, segs = (x0, x1), (sh0, sh1), (mods0, mods1), (segs0, segs1)
+        os_ = _per_rank(lambda r: self._attn(xs[r], shs[r], mods[r][0], mods[r][1], segs[r], st["rope%d" % r], topts))
+        # per-token tail pipelined in row chunks: out_proj -> swap -> gate -> mlp -> swap -> gate
+        n = x0.shape[0]
+        shape, size = (n, x0.shape[1]), -(-n // CHUNKS)
+        chunks = [(a, min(a + size, n)) for a in range(0, n, size)]
+        csegs = [[_chunk_segs(segs[r], a, b) for r in range(2)] for a, b in chunks]
+        own_a, sent_a = [], []
+        for a, b in chunks:
+            own_a.append(_per_rank(lambda r: _lin(os_[r][a:b] * (1.0 / S), shs[r]["out"])))
+            sent_a.append(self.xchg.send("attn", shape, (a, b), own_a[-1]))
+        own_m, sent_m = [], []
+        for j, (a, b) in enumerate(chunks):
+            got = self.xchg.recv("attn", shape, (a, b), sent_a[j])
 
-        m0 = self._mlp(x0, sh0, mods0[3], mods0[4], segs0)
-        with torch.cuda.device(d1):
-            m1 = self._mlp(x1, sh1, mods1[3], mods1[4], segs1)
-        r0, r1 = self.allreduce(m0, m1)
-        x0 = h3._mod_gate(x0, mods0[5], r0.float() * S, segs0)
-        with torch.cuda.device(d1):
-            x1 = h3._mod_gate(x1, mods1[5], r1.float() * S, segs1)
+            def attn_then_mlp(r):
+                xc = xs[r][a:b]
+                h3._mod_gate(xc, mods[r][2], (own_a[j][r] + got[r]).float() * S, csegs[j][r])
+                return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r])
+            own_m.append(_per_rank(attn_then_mlp))
+            sent_m.append(self.xchg.send("mlp", shape, (a, b), own_m[j]))
+        self.xchg.done("attn", shape)
+        for j, (a, b) in enumerate(chunks):
+            got = self.xchg.recv("mlp", shape, (a, b), sent_m[j])
+            _per_rank(lambda r: h3._mod_gate(xs[r][a:b], mods[r][5], (own_m[j][r] + got[r]).float() * S, csegs[j][r]))
+        self.xchg.done("mlp", shape)
 
         if ref is not None:
             self.checked = True
@@ -226,7 +280,13 @@ def _no_block_prefetch(executor, *args, **kwargs):
     topts = kwargs.get("transformer_options", args[3] if len(args) > 3 else None)
     if topts is not None:
         topts["prefetch_dynamic_vbars"] = False
-    return executor(*args, **kwargs)
+    # the Comfy compiler records one device's allocations per forward; TP allocates on two
+    prev = comfy.cli_args.args.disable_comfy_compiler
+    comfy.cli_args.args.disable_comfy_compiler = True
+    try:
+        return executor(*args, **kwargs)
+    finally:
+        comfy.cli_args.args.disable_comfy_compiler = prev
 
 
 class UNETLoaderH3TensorParallel:
@@ -246,8 +306,6 @@ class UNETLoaderH3TensorParallel:
         dm = model.model.diffusion_model
         if not isinstance(dm, h3.MiniMaxH3Model):
             raise ValueError("UNETLoaderH3TensorParallel only supports MiniMax H3 checkpoints")
-        # the Comfy compiler records one device's allocations per forward; TP allocates on two
-        comfy.cli_args.args.disable_comfy_compiler = True
         tp = H3TensorParallel(path, dm)
         for i in range(len(dm.blocks)):
             model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
