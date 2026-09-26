@@ -16,6 +16,7 @@ import comfy.sample as comfy_sample
 from nodes import NODE_CLASS_MAPPINGS as GLOBAL_NODE_CLASS_MAPPINGS
 from .kitchen_turing_fix import patch_comfy_kitchen_turing
 from .h3_mixed_precision import patch_minimax_h3_mixed_precision
+from .h3_tensor_parallel import UNETLoaderH3TensorParallel
 from .device_utils import (
     get_device_list,
     is_accelerator_available,
@@ -812,6 +813,8 @@ pulid_nodes = {
 register_and_count(["PuLID_ComfyUI", "pulid_comfyui"], pulid_nodes)
 
 register_and_count(["ComfyUI-WanVideoWrapper", "comfyui-wanvideowrapper"], _load_wanvideo_nodes)
+
+NODE_CLASS_MAPPINGS["UNETLoaderH3TensorParallel"] = UNETLoaderH3TensorParallel
 
 for item in registration_data:
     logger.info(fmt_reg.format(item['name'], item['found'], str(item['count'])))
