@@ -49,7 +49,9 @@ def _record(dev, stream=None):
 class _ChunkedExchange:
     """Row-parallel partial sums swapped chunk by chunk through pinned host buffers on side copy
     streams. Pinned buffers persist per (phase, shape), events guard their reuse by the next block;
-    device-side receives are chunk-sized temporaries (VRAM is full with the shards)."""
+    device receive buffers are allocated per block on the compute streams. No record_stream and no
+    copy-stream allocations: every partial is kept alive until the compute stream has waited on the
+    copy that read it (side streams that allocated OOMed next to dynamic VRAM)."""
 
     def __init__(self):
         self.copy = None
@@ -58,7 +60,7 @@ class _ChunkedExchange:
     def _buf(self, phase, shape, dtype=torch.float16):
         if self.copy is None:
             # MMH3_TP_SIDE_STREAMS=0 keeps the copies on the compute streams (no overlap; A/B knob)
-            side = os.environ.get("MMH3_TP_SIDE_STREAMS", "1") != "0"
+            side = os.environ.get("MMH3_TP_SIDE_STREAMS", "0") == "1"
             self.copy = [torch.cuda.Stream(d) if side else torch.cuda.current_stream(d) for d in DEVICES]
         key = (phase, shape)
         if key not in self.bufs:
@@ -78,9 +80,14 @@ class _ChunkedExchange:
                     cs.wait_event(buf["read"][1 - r])
                 with torch.cuda.stream(cs):
                     buf["host"][r][a:b].copy_(parts[r], non_blocking=True)
-                parts[r].record_stream(cs)
                 sent.append(_record(dev, cs))
         return sent
+
+    def begin(self, phase, shape, dtype=torch.float16):
+        """Per-block receive buffers, allocated on the compute streams before any copy is queued."""
+        buf = self._buf(phase, shape, dtype)
+        buf["recv"] = [torch.empty(shape, dtype=dtype, device=d) for d in DEVICES]
+        buf["alloc"] = [_record(d) for d in DEVICES]
 
     def recv(self, phase, shape, rows, sent):
         """H2D of the other rank's rows; returns per-rank views, ready on each compute stream."""
@@ -90,15 +97,16 @@ class _ChunkedExchange:
             with torch.cuda.device(dev):
                 cs = self.copy[r]
                 cs.wait_event(sent[1 - r])
+                if a == 0:
+                    cs.wait_event(buf["alloc"][r])
+                dst = buf["recv"][r][a:b]
                 with torch.cuda.stream(cs):
-                    dst = torch.empty((b - a,) + shape[1:], dtype=buf["host"][0].dtype, device=dev)
                     dst.copy_(buf["host"][1 - r][a:b], non_blocking=True)
                 ev = _record(dev, cs)
                 if b == shape[0]:
                     buf["read"][r] = ev
-                compute = torch.cuda.current_stream(dev)
-                compute.wait_event(ev)
-                dst.record_stream(compute)
+                    buf["recv"][r] = None  # freed on the compute stream once the block's users are queued
+                torch.cuda.current_stream(dev).wait_event(ev)
                 out.append(dst)
         return out
 
@@ -242,11 +250,13 @@ class H3TensorParallel:
         shape, size = (n, x0.shape[1]), -(-n // CHUNKS)
         chunks = [(a, min(a + size, n)) for a in range(0, n, size)]
         csegs = [[_chunk_segs(segs[r], a, b) for r in range(2)] for a, b in chunks]
+        self.xchg.begin("attn", shape)  # after attention: keeps the qkv peak unchanged
         own_a, sent_a = [], []
         for a, b in chunks:
             own_a.append(_per_rank(lambda r: _lin(os_[r][a:b] * (1.0 / S), shs[r]["out"])))
             sent_a.append(self.xchg.send("attn", shape, (a, b), own_a[-1]))
         del os_
+        self.xchg.begin("mlp", shape)
         own_m, sent_m = [], []
         for j, (a, b) in enumerate(chunks):
             got = self.xchg.recv("attn", shape, (a, b), sent_a[j])
