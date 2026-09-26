@@ -280,7 +280,13 @@ def _no_block_prefetch(executor, *args, **kwargs):
     topts = kwargs.get("transformer_options", args[3] if len(args) > 3 else None)
     if topts is not None:
         topts["prefetch_dynamic_vbars"] = False
-    # the Comfy compiler records one device's allocations per forward; TP allocates on two
+    return executor(*args, **kwargs)
+
+
+def _no_compiler(executor, *args, **kwargs):
+    # the Comfy compiler records one device's allocations per forward; TP allocates on two.
+    # H3 opens its malloc graph before DIFFUSION_MODEL wrappers run, so toggle at APPLY_MODEL.
+    # ponytail: process-global flag, fine while ComfyUI runs one prompt at a time
     prev = comfy.cli_args.args.disable_comfy_compiler
     comfy.cli_args.args.disable_comfy_compiler = True
     try:
@@ -311,4 +317,5 @@ class UNETLoaderH3TensorParallel:
             model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
                                           "dit", "double_block", i)
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "mmh3_tp", _no_block_prefetch)
+        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.APPLY_MODEL, "mmh3_tp", _no_compiler)
         return (model,)
