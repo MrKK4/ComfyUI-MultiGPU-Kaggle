@@ -18,6 +18,7 @@ from .kitchen_turing_fix import patch_comfy_kitchen_turing, patch_na3d_tiles_tur
 from .h3_mixed_precision import patch_minimax_h3_mixed_precision
 from .ltx_mixed_precision import patch_ltx_fp16
 from .h3_ref_cache import patch_minimax_h3_ref_cache
+from .sam3_profile import patch_sam3_profile
 from .ltx_vae_lowmem import patch_ltx_vae_lowmem
 from .h3_tensor_parallel import UNETLoaderH3TensorParallel
 from .h3_dual_vae import VAEDecodeH3DualGPU, VAEEncodeH3DualGPU
@@ -610,6 +611,7 @@ patch_na3d_tiles_turing()
 patch_minimax_h3_mixed_precision()
 patch_ltx_fp16()
 patch_minimax_h3_ref_cache()
+patch_sam3_profile()
 patch_ltx_vae_lowmem()
 _initialize_aimdo_visible_cuda_devices()
 
