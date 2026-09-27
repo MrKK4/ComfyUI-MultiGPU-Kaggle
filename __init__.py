@@ -14,7 +14,7 @@ import comfy.memory_management
 import comfy.model_patcher
 import comfy.sample as comfy_sample
 from nodes import NODE_CLASS_MAPPINGS as GLOBAL_NODE_CLASS_MAPPINGS
-from .kitchen_turing_fix import patch_comfy_kitchen_turing
+from .kitchen_turing_fix import patch_comfy_kitchen_turing, patch_na3d_tiles_turing
 from .h3_mixed_precision import patch_minimax_h3_mixed_precision
 from .ltx_mixed_precision import patch_ltx_fp16
 from .h3_tensor_parallel import UNETLoaderH3TensorParallel
@@ -603,6 +603,7 @@ _patch_model_management_current_stream()
 _patch_comfy_sample_runtime_device()
 _patch_comfy_kitchen_dlpack_device_guard()
 patch_comfy_kitchen_turing()
+patch_na3d_tiles_turing()
 patch_minimax_h3_mixed_precision()
 patch_ltx_fp16()
 _initialize_aimdo_visible_cuda_devices()

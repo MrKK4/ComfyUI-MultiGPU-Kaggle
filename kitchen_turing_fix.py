@@ -51,3 +51,17 @@ def patch_comfy_kitchen_turing():
     ck_cuda.fp16_linear = fp16_linear_guarded
     logger.info("[MultiGPU] SM80-only comfy_kitchen CUTLASS fp16 conv3d/linear routed to torch below Ampere")
     return True
+
+
+def patch_na3d_tiles_turing():
+    """kitchen's cuda/triton na3d need SM80, so a T4 runs the eager masked-SDPA na3d (LTX 2.x diffusion VAE decoder).
+    Its default score budget (2**25) picks large query tiles whose key regions are mostly masked; on T4 fp16 2**22
+    (tile [8, 8, 7] at k=11^3) is 1.8x faster with identical math (sweep: flat optimum around 8x8x8)."""
+    if not torch.cuda.is_available() or all(torch.cuda.get_device_capability(i)[0] >= 8 for i in range(torch.cuda.device_count())):
+        return
+    try:
+        ena = importlib.import_module("comfy_kitchen.backends.eager.na")
+    except ImportError:
+        return
+    ena.NA_SCORE_BUDGET = min(ena.NA_SCORE_BUDGET, 2 ** 22)
+    logger.info("[MultiGPU] comfy_kitchen eager na3d score budget set to 2**22 below Ampere")
