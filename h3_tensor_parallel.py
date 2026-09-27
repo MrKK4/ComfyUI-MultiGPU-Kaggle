@@ -192,6 +192,7 @@ class H3TensorParallel:
         self.eps1, self.eps2 = blk.norm1.eps, blk.norm2.eps
         self.qk_eps = blk.attn.q_norm.eps
         self.checked = os.environ.get("MMH3_TP_CHECK", "0") != "1"
+        self.prefetch_oom_n = float("inf")
 
     def _qkv(self, x, sh, shift, scale, segs):
         h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm1"], self.eps1), shift, scale, segs).to(torch.float16)
@@ -285,11 +286,17 @@ class H3TensorParallel:
                 return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r])
             own_m.append(_per_rank(attn_then_mlp))
             sent_m.append(self.xchg.send("mlp", shape, (a, b), own_m[j]))
-        nxt = i + 1 if QKV_PREFETCH and i + 1 < len(self.blocks) and ref is None else None
+        nxt = i + 1 if QKV_PREFETCH and i + 1 < len(self.blocks) and ref is None and n < self.prefetch_oom_n else None
         if nxt is not None:
             nmods = self._mods(nxt, args["t_emb"])
             nsh = (self.shards[0][nxt], self.shards[1][nxt])
-            nqkv = _per_rank(lambda r: torch.empty((n, 3 * nsh[r]["inner"]), dtype=torch.float16, device=DEVICES[r]))
+            try:
+                nqkv = _per_rank(lambda r: torch.empty((n, 3 * nsh[r]["inner"]), dtype=torch.float16, device=DEVICES[r]))
+            except torch.OutOfMemoryError:
+                # long sequences (~100k tokens): the extra qkv buffer does not fit next to this block's partials
+                self.prefetch_oom_n = n
+                logger.info(f"[MultiGPU TP] qkv prefetch off for {n}+ tokens (out of memory)")
+                nxt = None
         for j, (a, b) in enumerate(chunks):
             got = self.xchg.recv("mlp", shape, (a, b), sent_m[j])
 
