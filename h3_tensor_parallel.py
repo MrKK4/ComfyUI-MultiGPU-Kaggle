@@ -327,6 +327,13 @@ def _no_block_prefetch(executor, *args, **kwargs):
     return executor(*args, **kwargs)
 
 
+def _free_other_models(executor, *args, **kwargs):
+    # models loaded earlier in the session (e.g. SAM 3.1 in the face swap workflow) stay on cuda:0, and ComfyUI
+    # does not count the shards and TP activations it never allocated; unload them before the sampler loads
+    comfy.model_management.free_memory(1e30, DEVICES[0])
+    return executor(*args, **kwargs)
+
+
 class UNETLoaderH3TensorParallel:
     @classmethod
     def INPUT_TYPES(s):
@@ -352,4 +359,5 @@ class UNETLoaderH3TensorParallel:
             model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
                                           "dit", "double_block", i)
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "mmh3_tp", _no_block_prefetch)
+        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "mmh3_tp", _free_other_models)
         return (model,)
