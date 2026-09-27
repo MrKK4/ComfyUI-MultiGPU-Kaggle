@@ -18,7 +18,7 @@ from .kitchen_turing_fix import patch_comfy_kitchen_turing, patch_na3d_tiles_tur
 from .h3_mixed_precision import patch_minimax_h3_mixed_precision
 from .ltx_mixed_precision import patch_ltx_fp16
 from .h3_tensor_parallel import UNETLoaderH3TensorParallel
-from .h3_dual_vae import VAEDecodeH3DualGPU
+from .h3_dual_vae import VAEDecodeH3DualGPU, VAEEncodeH3DualGPU
 from .ltx_dual_vae import VAEDecodeLTXDualGPU
 from .device_utils import (
     get_device_list,
@@ -821,6 +821,7 @@ register_and_count(["ComfyUI-WanVideoWrapper", "comfyui-wanvideowrapper"], _load
 
 NODE_CLASS_MAPPINGS["UNETLoaderH3TensorParallel"] = UNETLoaderH3TensorParallel
 NODE_CLASS_MAPPINGS["VAEDecodeH3DualGPU"] = VAEDecodeH3DualGPU
+NODE_CLASS_MAPPINGS["VAEEncodeH3DualGPU"] = VAEEncodeH3DualGPU
 NODE_CLASS_MAPPINGS["VAEDecodeLTXDualGPU"] = VAEDecodeLTXDualGPU
 
 for item in registration_data:
