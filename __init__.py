@@ -17,6 +17,7 @@ from nodes import NODE_CLASS_MAPPINGS as GLOBAL_NODE_CLASS_MAPPINGS
 from .kitchen_turing_fix import patch_comfy_kitchen_turing, patch_na3d_tiles_turing
 from .h3_mixed_precision import patch_minimax_h3_mixed_precision
 from .ltx_mixed_precision import patch_ltx_fp16
+from .h3_ref_cache import patch_minimax_h3_ref_cache
 from .ltx_vae_lowmem import patch_ltx_vae_lowmem
 from .h3_tensor_parallel import UNETLoaderH3TensorParallel
 from .h3_dual_vae import VAEDecodeH3DualGPU, VAEEncodeH3DualGPU
@@ -608,6 +609,7 @@ patch_comfy_kitchen_turing()
 patch_na3d_tiles_turing()
 patch_minimax_h3_mixed_precision()
 patch_ltx_fp16()
+patch_minimax_h3_ref_cache()
 patch_ltx_vae_lowmem()
 _initialize_aimdo_visible_cuda_devices()
 
