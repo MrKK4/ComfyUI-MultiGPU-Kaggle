@@ -15,6 +15,8 @@ Numerics follow h3_mixed_precision: fp32 residual, fp16 block compute, fc2 / out
 import json
 import logging
 import os
+import time
+from collections import defaultdict
 
 import torch
 from safetensors import safe_open
@@ -319,11 +321,39 @@ class H3TensorParallel:
         return {"img": x0}
 
 
+PROFILE_FLAG = "tp_profile.request"  # in ComfyUI's working dir: the next sampling step is profiled into tp_profile.txt
+
+
+def _profiled(executor, *args, **kwargs):
+    os.remove(PROFILE_FLAG)
+    for d in DEVICES:
+        torch.cuda.synchronize(d)
+    t0 = time.perf_counter()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as prof:
+        out = executor(*args, **kwargs)
+        for d in DEVICES:
+            torch.cuda.synchronize(d)
+    wall = time.perf_counter() - t0
+    busy = defaultdict(float)
+    for e in prof.events():
+        if e.device_type == torch.autograd.DeviceType.CUDA:
+            busy[e.device_index] += e.self_device_time_total / 1e6
+    report = ["one TP forward (profiler on): wall %.2fs | kernel busy %s" % (wall, "  ".join(
+              "cuda:%d %.2fs" % (d, t) for d, t in sorted(busy.items()))),
+              prof.key_averages().table(sort_by="self_device_time_total", row_limit=35)]
+    with open("tp_profile.txt", "w") as f:
+        f.write("\n".join(report))
+    logger.info("[MultiGPU TP] profile written to %s: %s", os.path.abspath("tp_profile.txt"), report[0])
+    return out
+
+
 def _no_block_prefetch(executor, *args, **kwargs):
     # the model's own block weights are unused; prefetching would page all 21 GB in every step
     topts = kwargs.get("transformer_options", args[3] if len(args) > 3 else None)
     if topts is not None:
         topts["prefetch_dynamic_vbars"] = False
+    if os.path.exists(PROFILE_FLAG):
+        return _profiled(executor, *args, **kwargs)
     return executor(*args, **kwargs)
 
 
