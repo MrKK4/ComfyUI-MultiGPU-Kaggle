@@ -17,12 +17,14 @@ logger = logging.getLogger("MultiGPU")
 def patch_minimax_h3_ref_cache():
     if os.environ.get("MMH3_REF_CACHE", "1") == "0":
         return False
-    try:
-        import comfy_extras.nodes_minimax_h3 as nm
-        from comfy_api.latest import io
-    except ImportError:
+    import sys
+    import nodes
+    from comfy_api.latest import io
+    # ComfyUI loads its built-in node files under an internal module name, so patch the registered class
+    node = nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3ReferenceToVideo")
+    if node is None:
         return False
-    node = nm.MiniMaxH3ReferenceToVideo
+    nm = sys.modules[node.__module__]
     if getattr(node, "_mmh3_ref_cache", False):
         return True
     execute = node.execute.__func__

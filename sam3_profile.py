@@ -12,11 +12,11 @@ FLAG = "sam_profile.request"
 
 
 def patch_sam3_profile():
-    try:
-        import comfy_extras.nodes_sam3 as ns
-    except ImportError:
+    import nodes
+    # ComfyUI loads its built-in node files under an internal module name, so patch the registered class
+    node = nodes.NODE_CLASS_MAPPINGS.get("SAM3_VideoTrack")
+    if node is None:
         return False
-    node = ns.SAM3_VideoTrack
     if getattr(node, "_mmh3_profile", False):
         return True
     execute = node.execute.__func__
