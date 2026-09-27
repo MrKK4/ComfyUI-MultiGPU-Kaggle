@@ -180,6 +180,20 @@ def _load_shards(path, n_blocks):
     return shards
 
 
+def _scale_shift(h, shift, scale1, segs):
+    # h3._mod_scale_shift with 1 + scale precomputed: one fused addcmul per segment instead of add + mul_ + add_
+    for a, b, row in segs:
+        torch.addcmul(shift[row], h[a:b], scale1[row], out=h[a:b])
+    return h
+
+
+def _gate(x, gate_s, part, segs):
+    # h3._mod_gate on the fp16 partial sum; gate_s = gate * S folds the 1/S input scaling back in (exact, S = 2^6)
+    for a, b, row in segs:
+        x[a:b].addcmul_(part[a:b], gate_s[row])
+    return x
+
+
 def _lin(x, w, act=None):
     return ck_cuda.int8_linear(x, w[0], w[1], convrot=True, convrot_groupsize=256, input_act=act)
 
@@ -197,7 +211,7 @@ class H3TensorParallel:
         self.prefetch_oom_n = float("inf")
 
     def _qkv(self, x, sh, shift, scale, segs):
-        h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm1"], self.eps1), shift, scale, segs).to(torch.float16)
+        h = _scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm1"], self.eps1), shift, scale, segs).to(torch.float16)
         return _lin(h, sh["qkv"])
 
     def _attn(self, qkv, sh, rope, topts):
@@ -213,13 +227,17 @@ class H3TensorParallel:
         return optimized_attention(q, k, v, heads, mask=None, skip_reshape=True, transformer_options=topts).squeeze(0)
 
     def _mlp(self, x, sh, shift, scale, segs):
-        h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm2"], self.eps2), shift, scale, segs).to(torch.float16)
+        h = _scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm2"], self.eps2), shift, scale, segs).to(torch.float16)
         a = _lin(h, sh["fc1"])
         a[..., a.shape[-1] // 2:].mul_(1.0 / S)
         return _lin(a, sh["fc2"], act="swiglu")
 
     def _mods(self, i, t_emb):
-        mods0 = self.blocks[i].adaln_proj(t_emb)
+        m = self.blocks[i].adaln_proj(t_emb)
+        # shift, 1 + scale, gate * S (msa then mlp): the per-token modulation passes then fuse into one op each
+        # fp32 like the residual stream they modulate (h3's _mod_row casts to it too)
+        m = [t.float() for t in m]
+        mods0 = (m[0], 1.0 + m[1], m[2] * S, m[3], 1.0 + m[4], m[5] * S)
         with torch.cuda.device(DEVICES[1]):
             mods1 = [m.to(DEVICES[1], non_blocking=True) for m in mods0]
         return mods0, mods1
@@ -283,7 +301,7 @@ class H3TensorParallel:
 
             def attn_then_mlp(r):
                 xc = xs[r][a:b]
-                h3._mod_gate(xc, mods[r][2], (own_a[j][r] + got[r]).float() * S, csegs[j][r])
+                _gate(xc, mods[r][2], own_a[j][r].add_(got[r]), csegs[j][r])
                 own_a[j][r] = None
                 return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r])
             own_m.append(_per_rank(attn_then_mlp))
@@ -304,7 +322,7 @@ class H3TensorParallel:
 
             def gate_then_next_qkv(r):
                 xc = xs[r][a:b]
-                h3._mod_gate(xc, mods[r][5], (own_m[j][r] + got[r]).float() * S, csegs[j][r])
+                _gate(xc, mods[r][5], own_m[j][r].add_(got[r]), csegs[j][r])
                 if nxt is not None:
                     nqkv[r][a:b] = self._qkv(xc, nsh[r], nmods[r][0], nmods[r][1], csegs[j][r])
             _per_rank(gate_then_next_qkv)
