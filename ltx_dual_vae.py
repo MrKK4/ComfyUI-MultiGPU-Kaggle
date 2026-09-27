@@ -1,10 +1,14 @@
 """Dual-GPU LTX 2.x diffusion-VAE decode (Kaggle 2x T4, no P2P).
 
 The latent is split in two along width, each half keeping `overlap` pixels of context past the
-middle. The left half decodes on the VAE's device, the right half on a resident helper copy of the
-same VAE on the other GPU, in parallel threads. Each half runs ComfyUI's tiled 3D decode loop
+middle. The left half decodes on the VAE's device, the right half on a helper copy of the same VAE
+on the other GPU, in parallel threads. Each half runs ComfyUI's tiled 3D decode loop
 (tiled_scale_multidim, temporal tiles only), then the halves are blended linearly over the overlap.
-Both VAEs are loaded on the calling thread first: model management is not thread-safe.
+
+VRAM: nothing is evicted beyond a 2-latent-frame tile. Each half's temporal tile is sized to the
+VRAM free on its GPU. The helper is not a managed model: loading a plain ModelPatcher fully unloads
+the dynamic DiT from that GPU (re-streamed from disk on the next job, ~50 s on Kaggle), so its
+weights are moved to the GPU for the decode and back to CPU afterwards.
 """
 import logging
 import threading
@@ -13,19 +17,36 @@ import torch
 
 import comfy.ldm.lightricks.vae.na_diffusion_decoder as nd
 import comfy.model_management
+import comfy.sd
 import comfy.utils
 import folder_paths
 
-from .h3_dual_vae import _helper
-
 logger = logging.getLogger("MultiGPU")
+
+_HELPERS = {}
+_MARGIN = 768 * 1024 * 1024
+
+
+def _helper(vae_name, device):
+    key = (vae_name, str(device))
+    if key not in _HELPERS:
+        sd, metadata = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("vae", vae_name), return_metadata=True)
+        _HELPERS[key] = comfy.sd.VAE(sd=sd, device=torch.device(device), metadata=metadata)
+    return _HELPERS[key]
+
+
+def _fit_tile_t(vae, z, tile_t):
+    """Largest temporal tile (latent frames) whose decode estimate fits the VRAM free on vae.device."""
+    per_frame = vae.memory_used_decode([1, z.shape[1], 1, z.shape[3], z.shape[4]], vae.vae_dtype)
+    free = comfy.model_management.get_free_memory(vae.device) - _MARGIN
+    return max(2, min(tile_t, z.shape[2], int(free // per_frame)))
 
 
 def _decode_half(vae, z, tile_t, overlap_t, out, err):
     try:
         with torch.inference_mode(), torch.cuda.device(vae.device):
             fn = lambda a: vae.first_stage_model.decode(a.to(vae.device, vae.vae_dtype)).to(dtype=vae.vae_output_dtype())
-            px = comfy.utils.tiled_scale_multidim(z, fn, tile=(tile_t, z.shape[3], z.shape[4]), overlap=(overlap_t, 1, 1),
+            px = comfy.utils.tiled_scale_multidim(z, fn, tile=(tile_t, z.shape[3], z.shape[4]), overlap=(min(overlap_t, tile_t - 1), 1, 1),
                                                   upscale_amount=vae.upscale_ratio, out_channels=vae.output_channels,
                                                   index_formulas=vae.upscale_index_formula, output_device=vae.output_device)
             out.append(vae.process_output(px))
@@ -46,8 +67,8 @@ class VAEDecodeLTXDualGPU:
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "decode"
     CATEGORY = "multigpu"
-    DESCRIPTION = ("LTX 2.x video decode split left/right over two GPUs: helper_vae_name is the same VAE file, kept resident on "
-                   "helper_device. overlap in pixels; temporal_size/overlap in frames (lower temporal_size if a half runs out of VRAM).")
+    DESCRIPTION = ("LTX 2.x video decode split left/right over two GPUs: helper_vae_name is the same VAE file, used on helper_device. "
+                   "overlap in pixels; temporal_size/overlap in frames (upper bound: tiles also shrink to fit free VRAM).")
 
     def decode(self, samples, vae, helper_vae_name, helper_device, overlap, temporal_size, temporal_overlap):
         z = samples["samples"]
@@ -63,18 +84,26 @@ class VAEDecodeLTXDualGPU:
         else:
             mid = w // 2
             left, right = z[..., :mid + ov], z[..., mid - ov:]
-            shape = list(right.shape)
-            shape[2] = min(shape[2], tile_t)
-            mem = vae.memory_used_decode(shape, vae.vae_dtype)
+            min_mem = vae.memory_used_decode([1, z.shape[1], 2, z.shape[3], right.shape[4]], vae.vae_dtype)
+            comfy.model_management.load_models_gpu([vae.patcher], memory_required=min_mem, force_full_load=True)
             helper = _helper(helper_vae_name, helper_device)
-            comfy.model_management.load_models_gpu([vae.patcher], memory_required=mem, force_full_load=True)
-            comfy.model_management.load_models_gpu([helper.patcher], memory_required=mem, force_full_load=True)
-            out_r, err = [], []
-            t = threading.Thread(target=_decode_half, args=(helper, right, tile_t, overlap_t, out_r, err))
-            t.start()
-            out_l = []
-            _decode_half(vae, left, tile_t, overlap_t, out_l, err)
-            t.join()
+            helper.first_stage_model.to(helper.device)
+            try:
+                if comfy.model_management.get_free_memory(helper.device) - _MARGIN < min_mem:
+                    comfy.model_management.free_memory(min_mem + _MARGIN, helper.device)
+                tl, tr = _fit_tile_t(vae, left, tile_t), _fit_tile_t(helper, right, tile_t)
+                logger.info("[MultiGPU] VAEDecodeLTXDualGPU: temporal tiles (latent frames of %d): %s %d, %s %d",
+                            z.shape[2], vae.device, tl, helper.device, tr)
+                out_r, err = [], []
+                t = threading.Thread(target=_decode_half, args=(helper, right, tr, overlap_t, out_r, err))
+                t.start()
+                out_l = []
+                _decode_half(vae, left, tl, overlap_t, out_l, err)
+                t.join()
+            finally:
+                helper.first_stage_model.to(comfy.model_management.vae_offload_device())
+                with torch.cuda.device(helper.device):
+                    torch.cuda.empty_cache()
             if err:
                 raise err[0]
             l, r = out_l[0], out_r[0]
