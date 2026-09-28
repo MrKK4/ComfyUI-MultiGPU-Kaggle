@@ -20,6 +20,7 @@ from .ltx_mixed_precision import patch_ltx_fp16
 from .h3_ref_cache import patch_minimax_h3_ref_cache
 from .h3_qwen_cache import patch_h3_qwen_cache
 from .sam3_profile import patch_sam3_profile
+from .post_gpu import patch_post_gpu
 from .sam3_fast import patch_sam3_fast
 from .tp_diag import patch_tp_diag
 from .ltx_vae_lowmem import patch_ltx_vae_lowmem
@@ -616,6 +617,7 @@ patch_ltx_fp16()
 patch_minimax_h3_ref_cache()
 patch_h3_qwen_cache()
 patch_sam3_profile()
+patch_post_gpu()
 patch_sam3_fast()
 patch_tp_diag()
 patch_ltx_vae_lowmem()
