@@ -25,6 +25,11 @@ and how confident the number is.
 
 Tier 1 alone: **542 → ~450 s** (≈ −17%), and none of it touches model math, so quality cannot move.
 
+**Status: SAM batching is built** — `sam3_fast.py`, on by default (`MMH3_SAM_FAST=0` disables), with
+`check_sam_fast.py` proving both rewritten paths decision-identical to upstream on random masks.
+The Qwen cache split and the CPU threading are not started. Expected SAM saving is 27–37 s; the
+before/after is `sam_fast.txt` plus the existing `sam_profile.request` profiler.
+
 Downside risk: low everywhere. The only real risk is the SAM rewrite changing a mask edge, which
 is checkable frame-by-frame against today's output.
 
