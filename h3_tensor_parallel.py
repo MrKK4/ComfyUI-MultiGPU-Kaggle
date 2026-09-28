@@ -28,6 +28,7 @@ import comfy.patcher_extension
 import comfy.quant_ops
 import comfy.rmsnorm
 import comfy.sd
+import comfy.weight_adapter
 import comfy_kitchen.backends.cuda as ck_cuda
 import folder_paths
 import comfy.ldm.minimax.model as h3
@@ -184,6 +185,40 @@ def _lin(x, w, act=None):
     return ck_cuda.int8_linear(x, w[0], w[1], convrot=True, convrot_groupsize=256, input_act=act)
 
 
+# LoRA: the shards stay the file's int8 weights; each patched linear gets a low-rank side path x @ down.T @ up.T,
+# sharded like its weight (column-parallel: rows of up; row-parallel: columns of down), so the partial sums still add up.
+LORA_TARGETS = ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
+
+
+def _lora_factors(entries):
+    """(down with strength * alpha / rank folded in, up) of the LoRA patches on one weight, stacked along the rank."""
+    downs, ups = [], []
+    for strength, adapter, strength_model, offset, function in entries:
+        w = adapter.weights if isinstance(adapter, comfy.weight_adapter.LoRAAdapter) else None
+        if w is None or strength_model != 1.0 or offset is not None or function is not None or w[3] is not None or w[4] is not None:
+            raise ValueError("H3 tensor parallel supports plain LoRA only (no LoCon mid, DoRA, LoHa/LoKr, offsets or model strength != 1)")
+        down, up = w[1].flatten(1).float(), w[0].flatten(1).float()
+        alpha = float(w[2]) / down.shape[0] if w[2] is not None else 1.0
+        downs.append(down * (strength * alpha))
+        ups.append(up)
+    return torch.cat(downs), torch.cat(ups, dim=1)
+
+
+def _shard_lora(name, down, up, rank):
+    if name == "attn.qkv_proj":
+        inner = up.shape[0] // 3
+        return down, _rows(up, inner, inner // 2, rank)
+    if name == "mlp.fc1":
+        ffn = up.shape[0] // 2
+        return down, _rows(up, ffn, ffn // 2, rank)
+    half = down.shape[1] // 2  # out_proj / fc2 are row-parallel: each rank holds half the input columns
+    return down[:, rank * half:(rank + 1) * half], up
+
+
+def _lora(x, pair):
+    return torch.nn.functional.linear(torch.nn.functional.linear(x, pair[0]), pair[1])
+
+
 class H3TensorParallel:
     def __init__(self, path, diffusion_model):
         self.path = path
@@ -195,10 +230,45 @@ class H3TensorParallel:
         self.qk_eps = blk.attn.q_norm.eps
         self.checked = os.environ.get("MMH3_TP_CHECK", "0") != "1"
         self.prefetch_oom_n = float("inf")
+        self.lora, self.lora_sig = None, ()
 
-    def _qkv(self, x, sh, shift, scale, segs):
+    def set_lora(self, patches):
+        """Build the side paths for the LoRA patches on the block linears (called once per sampling run)."""
+        entries, ignored = {}, []
+        for key, value in patches.items():
+            parts = key.split(".")
+            if len(parts) < 5 or parts[:2] != ["diffusion_model", "blocks"]:
+                continue  # non-block layers run on ComfyUI's own patched modules
+            name = ".".join(parts[3:-1])
+            if name in LORA_TARGETS and parts[-1] == "weight":
+                entries[(int(parts[2]), name)] = value
+            elif not name.startswith("adaln_proj"):  # adaln_proj also runs on the patched original module
+                ignored.append(key)
+        sig = tuple(sorted((k, tuple((id(p[1]), p[0]) for p in v)) for k, v in entries.items()))
+        if sig == self.lora_sig:
+            return
+        if ignored:
+            logger.warning("[MultiGPU TP] LoRA keys not applied under tensor parallel: %d (e.g. %s)", len(ignored), ignored[0])
+        self.lora = None
+        if entries:
+            self.lora = [[{} for _ in self.blocks] for _ in DEVICES]
+            for (i, name), value in entries.items():
+                down, up = _lora_factors(value)
+                for rank, dev in enumerate(DEVICES):
+                    d, u = _shard_lora(name, down, up, rank)
+                    self.lora[rank][i][name] = (d.to(dev, torch.float16).contiguous(), u.to(dev, torch.float16).contiguous())
+            logger.info("[MultiGPU TP] LoRA side paths on %d block linears", len(entries))
+        self.lora_sig = sig
+
+    def _block_lora(self, i):
+        return ({}, {}) if self.lora is None else (self.lora[0][i], self.lora[1][i])
+
+    def _qkv(self, x, sh, shift, scale, segs, lora):
         h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm1"], self.eps1), shift, scale, segs).to(torch.float16)
-        return _lin(h, sh["qkv"])
+        out = _lin(h, sh["qkv"])
+        if "attn.qkv_proj" in lora:
+            out += _lora(h, lora["attn.qkv_proj"])
+        return out
 
     def _attn(self, qkv, sh, rope, topts):
         s, heads = qkv.shape[0], sh["heads"]
@@ -212,11 +282,17 @@ class H3TensorParallel:
         v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
         return optimized_attention(q, k, v, heads, mask=None, skip_reshape=True, transformer_options=topts).squeeze(0)
 
-    def _mlp(self, x, sh, shift, scale, segs):
+    def _mlp(self, x, sh, shift, scale, segs, lora):
         h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm2"], self.eps2), shift, scale, segs).to(torch.float16)
         a = _lin(h, sh["fc1"])
+        if "mlp.fc1" in lora:
+            a += _lora(h, lora["mlp.fc1"])
         a[..., a.shape[-1] // 2:].mul_(1.0 / S)
-        return _lin(a, sh["fc2"], act="swiglu")
+        out = _lin(a, sh["fc2"], act="swiglu")
+        if "mlp.fc2" in lora:
+            gate, up = a.chunk(2, dim=-1)  # the swiglu the int8 kernel fuses, in the same 1/S-scaled space
+            out += _lora(torch.nn.functional.silu(gate).mul_(up), lora["mlp.fc2"])
+        return out
 
     def _mods(self, i, t_emb):
         mods0 = self.blocks[i].adaln_proj(t_emb)
@@ -250,6 +326,7 @@ class H3TensorParallel:
         st = self._step_state(args["img"], args)
         x1, segs0, segs1, topts = st["x1"], args["mod_segments"], st["segs1"], args["transformer_options"]
         sh0, sh1 = self.shards[0][i], self.shards[1][i]
+        lo = self._block_lora(i)
         pre = st.pop("pre", None)
         if pre is not None and pre[0] == i:
             _, mods0, mods1, qkv = pre
@@ -262,7 +339,7 @@ class H3TensorParallel:
 
         xs, shs, mods, segs = (x0, x1), (sh0, sh1), (mods0, mods1), (segs0, segs1)
         if qkv is None:
-            qkv = _per_rank(lambda r: self._qkv(xs[r], shs[r], mods[r][0], mods[r][1], segs[r]))
+            qkv = _per_rank(lambda r: self._qkv(xs[r], shs[r], mods[r][0], mods[r][1], segs[r], lo[r]))
         os_ = _per_rank(lambda r: self._attn(qkv[r], shs[r], st["rope%d" % r], topts))
         del qkv
         # per-token tail pipelined in row chunks: out_proj -> swap -> gate -> mlp -> swap -> gate
@@ -273,7 +350,13 @@ class H3TensorParallel:
         self.xchg.begin("attn", shape)  # after attention: keeps the qkv peak unchanged
         own_a, sent_a = [], []
         for a, b in chunks:
-            own_a.append(_per_rank(lambda r: _lin(os_[r][a:b] * (1.0 / S), shs[r]["out"])))
+            def out_proj(r):
+                xs_ = os_[r][a:b] * (1.0 / S)
+                out = _lin(xs_, shs[r]["out"])
+                if "attn.out_proj" in lo[r]:
+                    out += _lora(xs_, lo[r]["attn.out_proj"])  # partial sum, same 1/S-scaled space as the shard's
+                return out
+            own_a.append(_per_rank(out_proj))
             sent_a.append(self.xchg.send("attn", shape, (a, b), own_a[-1]))
         del os_
         self.xchg.begin("mlp", shape)
@@ -285,13 +368,14 @@ class H3TensorParallel:
                 xc = xs[r][a:b]
                 h3._mod_gate(xc, mods[r][2], (own_a[j][r] + got[r]).float() * S, csegs[j][r])
                 own_a[j][r] = None
-                return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r])
+                return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r], lo[r])
             own_m.append(_per_rank(attn_then_mlp))
             sent_m.append(self.xchg.send("mlp", shape, (a, b), own_m[j]))
         nxt = i + 1 if QKV_PREFETCH and i + 1 < len(self.blocks) and ref is None and n < self.prefetch_oom_n else None
         if nxt is not None:
             nmods = self._mods(nxt, args["t_emb"])
             nsh = (self.shards[0][nxt], self.shards[1][nxt])
+            nlo = self._block_lora(nxt)
             try:
                 nqkv = _per_rank(lambda r: torch.empty((n, 3 * nsh[r]["inner"]), dtype=torch.float16, device=DEVICES[r]))
             except torch.OutOfMemoryError:
@@ -306,7 +390,7 @@ class H3TensorParallel:
                 xc = xs[r][a:b]
                 h3._mod_gate(xc, mods[r][5], (own_m[j][r] + got[r]).float() * S, csegs[j][r])
                 if nxt is not None:
-                    nqkv[r][a:b] = self._qkv(xc, nsh[r], nmods[r][0], nmods[r][1], csegs[j][r])
+                    nqkv[r][a:b] = self._qkv(xc, nsh[r], nmods[r][0], nmods[r][1], csegs[j][r], nlo[r])
             _per_rank(gate_then_next_qkv)
             own_m[j] = None
         if nxt is not None:
@@ -357,10 +441,12 @@ def _no_block_prefetch(executor, *args, **kwargs):
     return executor(*args, **kwargs)
 
 
-def _free_other_models(executor, *args, **kwargs):
+def _prepare_sampling(tp, executor, *args, **kwargs):
     # models loaded earlier in the session (e.g. SAM 3.1 in the face swap workflow) stay on cuda:0, and ComfyUI
     # does not count the shards and TP activations it never allocated; unload them before the sampler loads
     comfy.model_management.free_memory(1e30, DEVICES[0])
+    # the guider's patcher carries any LoRA added after this loader (LoraLoaderModelOnly etc.)
+    tp.set_lora(executor.class_obj.model_patcher.patches)
     return executor(*args, **kwargs)
 
 
@@ -389,5 +475,6 @@ class UNETLoaderH3TensorParallel:
             model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
                                           "dit", "double_block", i)
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "mmh3_tp", _no_block_prefetch)
-        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "mmh3_tp", _free_other_models)
+        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "mmh3_tp",
+                                   lambda executor, *a, **k: _prepare_sampling(tp, executor, *a, **k))
         return (model,)
