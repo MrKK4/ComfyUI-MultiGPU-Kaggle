@@ -3,6 +3,7 @@ Model Management Extensions for MultiGPU
 Extends ComfyUI's model management with multi-device capabilities and lifecycle tracking.
 """
 
+import os
 import torch
 import logging
 import hashlib
@@ -110,7 +111,9 @@ def multigpu_memory_log(identifier, tag):
 # Memory Management and Cleanup
 # ==========================================================================================
 
-CPU_MEMORY_THRESHOLD_PERCENT = 85.0
+# Host-RAM share above which the whole ComfyUI output cache is dropped. MULTIGPU_CPU_RESET_PERCENT=100 turns it off
+# (ComfyUI's own RAM-pressure cache still evicts): on Kaggle RAM sits above 85% and the reset threw away cached work.
+CPU_MEMORY_THRESHOLD_PERCENT = float(os.environ.get("MULTIGPU_CPU_RESET_PERCENT", "85"))
 CPU_RESET_HYSTERESIS_PERCENT = 5.0
 _last_cpu_usage_at_reset = 0.0
 
