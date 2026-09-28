@@ -1,119 +1,100 @@
-# Step budget, what I fixed, and the two commands that decide the next fix
+# H3 TP step budget — what is measured, what is not, and what to do next
 
-## What changed this turn
+Rewritten after review. Four claims in the previous version did not hold; they are retracted below
+with the reason, because the corrections matter more than the numbers they replaced.
 
-1. **`turing_attention.py` — two real bugs found without a GPU, both would have hit on Kaggle:**
-   - a `SyntaxError` (duplicate `D` parameter in both new int8 quant kernels) — the module would
-     not even import;
-   - an arity bug at the launch sites (an extra `dim` positional against kernels that take `N`
-     plus a `D` constexpr) — `TypeError` on the first launch of the int8 backend.
-   Also: the int8 flash kernel no longer round-trips K/V through fp32 (`int8 → fp32 → int8` in the
-   inner loop, pure waste when the whole point is beating the kitchen kernel's throughput), and the
-   selftest defaults are now your real shape (`--n 28500 --heads 28 --dim 128`, int8 in the sweep).
-2. **`check_kernels.py` — new, no torch needed.** It AST-matches every `_KERNEL[grid](...)`
-   launcher call against its kernel definition and fails on arity/keyword mismatches. I verified it
-   catches the exact bug above by reintroducing it. Run it after any kernel edit; it is the only
-   check available here that would have caught both.
-3. **`h3_tensor_parallel.py`** already carries the phase timer from the previous round
-   (`MMH3_TP_PHASE=1`, `_SYNC=1`, `_STEPS`, `_SKIP` → `tp_phase.txt`), plus pooled CUDA events in
-   `_ChunkedExchange` (2,600 `cudaEventCreate`/step removed). Unchanged this turn.
+## Retracted
 
-Nothing has run on a GPU: there is still no torch in this sandbox. Everything below marked
-"arithmetic" is arithmetic.
+1. **"Per-step weight re-staging (~7–9 GB per rank per step) is the hidden fixed cost."**
+   Wrong premise. Tensor parallel does not re-stage weights: `_load_shards` puts each rank's half in
+   VRAM once, and `_no_block_prefetch` disables the model's block prefetch precisely because it
+   "would page all 21 GB in every step". So the residency proposal I built on top of it ("pin
+   fc1/fc2, re-stage the overflow once per job") was fixing something that does not happen.
+2. **"48 s of kernel time inside a 42.5 s step is a contradiction."** It is not. The profiled step
+   ran ~50.3 s with the profiler attached, and kernels on the compute and copy streams overlap, so
+   summed kernel time can exceed wall time. There was nothing to explain.
+3. **"1.59× the work cost only 1.39× the time, therefore ~15 s of the step is fixed."** The fit
+   used pixels × frames as a single linear work proxy while attention grows with the square of the
+   token count, and text/reference/audio tokens do not grow with frame count at all. With two data
+   points and three plausible terms (constant, linear, quadratic) the decomposition is
+   underdetermined — no fixed term can be read off it, in either direction. The 141-frame numbers
+   also disagree with each other (50.3 s profiled, ~52 s, 58.9 s derived from V25), so even the
+   two-point slope is unstable.
+4. **"fp16 residual stream with a 1/16 fold, ~5% relative rounding."** The fold and the rounding
+   figure were hand-waved: the safety of the fold depends on a sampled peak, fp16 rounds the
+   residual on every one of 50 writes, and an outlier above 16× that peak clips with no warning.
+   It is a quality risk that needs an A/B on a real clip, not a free win. It is also not
+   implemented in this branch — it was, and remains, a proposal.
 
-## The step, per class (0.5 MP × 124 f, your profile)
+## Two arithmetic errors of my own, found while re-checking
 
-| class | seconds | share | headroom | verdict |
-|---|---|---|---|---|
-| int8 attention | **14.9** | 35% | 27% of int8 peak; ~7 s realistic | **biggest single lever** |
-| int8 matmuls | 10.6 | 25% | 79% of int8 peak | at the wall, ~2 s |
-| small elementwise ops | **10.6** | 25% | ~3.9 s HBM floor | **second lever** |
-| PCIe exchange (overlapped) | 6.4 | 15% | ~2 s by arithmetic | leave alone for now |
-| sum | 42.5 | | | |
+- The GEMM "floor" used 65e12 MAC/s as the T4's int8 peak. The card is 130 TOPS int8 = **65e12
+  MAC/s**, so the floor for 5.49e14 MAC/step (both ranks) is **4.2 s**, not 8.4 s. The measured
+  10.6 s is therefore ~40% of peak, not "79%, at the wall" — the opposite conclusion from the one
+  I drew.
+- The attention "floor" ignored memory entirely. Flash attention re-reads K/V once per query tile:
+  traffic ≈ `2 · heads · n² · HEAD · bytes / BLOCK_M`. At 28 heads, n = 28.5k, HEAD = 128, int8
+  K/V, BLOCK_M = 128 that is ~45 GB **per call**, i.e. ~290 GB/s sustained over the measured 335 ms
+  — close to a T4's ~320 GB/s. If that model is right, attention is memory-bound at its own tile
+  size, not "3× off the compute wall", and the only way to make it materially faster is to reduce
+  K/V traffic (a bigger query tile), not to schedule the same traffic better.
 
-Two things worth flagging in these numbers:
+Neither of those floors should be used again without the trace. The formula above is at least
+testable: if attention is traffic-bound, ms/call should fall roughly linearly in 1/BLOCK_M.
 
-- Attention runs at **34.8 TOPS = 27% of the T4's int8 peak**, while the matmuls manage 79% of the
-  same peak. The attention kernel is not at the wall; it is 3× off it. It is still 6.6× faster
-  than PyTorch fp16 SDPA (111 s/step vs 42.5), so the only thing that can beat it is another,
-  better-scheduled **int8** kernel — a faster fp16 path does not exist here.
-- Small ops cost 10.6 s against a 3.9 s data floor. The gap is the fp32 residual stream and the
-  fp16↔fp32 casts around every block. The block is homogeneous of degree 1 in the residual
-  (rms_norm is scale-invariant, gates are linear, adaLN acts on the block input, not the
-  residual), so a fixed 1/16 fold puts the residual in fp16 safely (peak 4.6e5 → 2.9e4, 2.2×
-  under fp16 max) and halves six fp32 passes plus the casts, for ~5% relative rounding.
+## Measured facts, kept
 
-## But first: 1.59× the work only cost 1.39× the time
-
-| job | work (px × frames) | warm step |
+| item | value | source |
 |---|---|---|
-| 0.5 MP × 124 f | 1.00 | 42.5 s |
-| 0.7 MP × 141 f | 1.59 | 58.9 s (V25: 141.9 s first step, then (436.3 − 141.9)/5) |
+| step, 0.5 MP × 124 f, 6 steps | 42.5 s warm (47.9 s first) | your runs |
+| per-class share | attention 35%, int8 matmuls 25%, small elementwise 25%, PCIe exchange 15% | your profile |
+| both GPUs | busy for the whole step | your observation |
+| int8 attention kernel | 335 ms/call, 34.8 TOPS = 27% of int8 compute peak | your profile |
+| fp16 SDPA instead | 111 s/step vs 42.5 | measured, closed |
+| small-op fusion attempt | 44.9 vs 42.1–43.4 s/step | measured, closed |
+| exchange | overlapped on side streams; 6.4 s/step | your profile |
 
-Solving `step = F + P·work`: **F ≈ 15 s fixed + P ≈ 28 s proportional**. A third of the step does
-not scale with tokens. Candidates: per-step weight re-staging (~7–9 GB of int8 weights per rank
-per step, ≈25–40 s at a 70 W-capped T4's sustained bandwidth — the right size), or per-op CPU
-dispatch (one core is pegged at ~100% in your profiles).
+Everything else in this file is arithmetic on top of those, and inherits their uncertainty.
 
-**Two contradictions I cannot settle from here, both resolved by the commands below:**
-
-1. The profile says ~48 s of kernel time per GPU per step, but the step is 42.5 s. Those cannot
-   both be one step — so either the profile is from a different (larger) step, or the 48 s is the
-   sum over both GPUs (⇒ ~24 s per GPU, GPU ~54% busy, ~20 s of per-step idle). Your "both GPUs
-   were busy" observation points at the first reading, the SAM profile's 54% busy / 100% core
-   points at the second.
-2. The same trace has to say whether that fixed ~15 s lives in the matmul class (weight
-   streaming), in the gaps between kernels (dispatch), or in the sampler outside the blocks.
-
-## Run these two, then I know which fix to build
+## What the trace still has to settle
 
 ```
-# 1. per-phase times inside every block: CPU issue time vs true GPU time
-MMH3_TP_PHASE=1 MMH3_TP_PHASE_STEPS=2 python main.py ...        # -> tp_phase.txt
-
-# 2. one profiled step, per-device classes
-MMH3_TP_DIAG=1 python main.py ...            # -> tp_diag.txt (run start)
-touch tp_profile.request                     # -> tp_diag_trace.json (one step), then:
-python tp_diag.py analyze                    # per-device resident vs kernel, per class, PCIe GiB
+MMH3_TP_PHASE=1 MMH3_TP_PHASE_STEPS=2 python main.py ...   # -> tp_phase.txt
+MMH3_TP_DIAG=1 python main.py ...                          # -> tp_diag.txt (start)
+touch tp_profile.request                                   # -> tp_diag_trace.json (one step)
+python tp_diag.py analyze                                  # per device, per class, PCIe GiB
 ```
 
-Decision table for what comes back:
+1. **Summed kernel seconds per device ÷ step wall.** If the classes sum to ~42 s per device the
+   step is work-bound with no idle; if they sum to ~25 s, a third of every step is idle and the
+   question becomes why (dispatch, events, allocator).
+2. **PCIe GiB per direction.** ~1–2 GB/step means the copies class in the profile is mostly
+   bookkeeping and the exchange needs no further work; tens of GB/step means the arithmetic needs
+   redoing from the real numbers instead of my estimates.
+3. **Attention: which of the two rooflines binds.** Compare ms/call across BLOCK_M in
+   `python turing_attention.py --selftest` — flatter than 1/BLOCK_M means compute-bound, roughly
+   linear in 1/BLOCK_M means traffic-bound, and the two call for completely different kernels.
 
-| what `tp_phase.txt` shows | what it means | fix I build |
-|---|---|---|
-| CPU ms/block ≈ GPU ms/block, sum ≈ step | GPU-work-bound, no idle | better int8 attention tiles + fp16 residual stream |
-| CPU ms/block ≫ GPU ms/block | dispatch-bound (one core) | fewer ops per block: fold scales into the int8 quant, one-shot exchange, cached streams/events, then graph capture |
-| in-block wall ≪ step | time is outside the blocks | sampler/nodes, not the DiT |
+## Levers, ranked by how certain they are
 
-The same report also settles the two contradictions above: `tp_diag.py analyze` prints per-device
-kernel seconds and the PCIe GiB per direction — if the copies are ~1–2 GB/step, the exchange
-arithmetic in the old budget was mis-scaled by ~10× and the copies class is noise.
+**Certain, outside the sampler (from pipeline_levers.md):** SAM 3.1 batching (built, `sam3_fast.py`),
+the Qwen3-VL ViT/LLM cache split, threaded CPU post. ~95 s per video combined, no model math touched.
 
-## Job-level wins, independent of all of the above
+**Needs the trace first:** the attention kernel (traffic vs compute question above), the fp16
+residual stream (risk-gated, needs a clip A/B), and the exchange chunking.
 
-Sampling is 255 s of an 8–10 minute video; SAM (107 s) + Qwen3-VL (59 s) + VAE (81 s) + CPU
-mask/MP4 (40 s) is 287 s — more than the sampler. These do not depend on the DiT diagnosis:
+**Closed, do not revisit:** fp16 attention (111 s/step), W4A8 (grainy), fewer steps, SAM every 4/8,
+hand-fused modulation ops, weight residency (nothing to fix — see retraction 1).
 
-- **SAM 3.1**: ~35 `cudaStreamSynchronize` and ~4k launches per frame, one core 100%, GPU ~40%
-  idle. Detection must stay per frame; the fix is batching the per-frame work and syncing once per
-  N frames. Worth 25–40 s/video.
-- **Qwen3-VL 32B**: split the cache at the ViT/LLM boundary so a prompt tweak re-runs only the LLM;
-  the face image alone is already cached. Worth 40–50 s when the prompt repeats.
-- **CPU blur/uncrop/MP4**: single-threaded ~40 s; thread it. Worth 20–40 s.
+## Fixed in this round
 
-Realistic landing zone for a new video: ~550 s → 400–450 s from these three alone, with the DiT
-work on top.
-
-## If the phase report says GPU-work-bound
-
-Then the ladder is: int8 attention kernel (5.8 s of the 14.9 s is recoverable at 65% of int8 peak —
-`python turing_attention.py --selftest --n 28500 --heads 28 --dim 128` measures it in one command),
-then the fp16 residual stream (~5 s), then the PCIe arithmetic's ~4 s. Both levers together put the
-step at ~30 s and sampling at ~180 s.
-
-## What not to do
-
-- Do not switch attention to fp16: 111 s/step vs 42.5.
-- Do not fuse the modulation ops by hand: one measured attempt was slower (44.9 vs 42.1–43.4 s/step).
-  The fp16 residual stream is the version of that idea which can pay.
-- Do not reduce steps or SAM frequency: you already showed both cost quality.
+- **Row-chunked attention was mathematically wrong** (opt-in now, `MMH3_TP_ATTN_PIPELINE=1`): it fed
+  `qkv[a:b]` to `_attn`, which splits its argument into q, k and v, so each band attended only to
+  its own rows — wrong output at about a quarter of the attention work. Now rope is applied once to
+  the whole sequence and only the *queries* are banded; `check_tp_attn.py` proves the chunked path
+  equals the sequential path and that the old shape fails by 196% of the output scale.
+- **Event reuse broke the chunk overlap** (default path): `sent`/`read` events were shared across
+  chunks, so every receive waited on the last chunk's record. Per-chunk keys now; `check_tp_events.py`
+  reproduces the exact binding (`sent#4` for all four receives) and proves the fix.
+- **Cached compute stream reverted**: the exchange now reads `torch.cuda.current_stream` per use
+  again, so a stream switch cannot silently drop a wait.

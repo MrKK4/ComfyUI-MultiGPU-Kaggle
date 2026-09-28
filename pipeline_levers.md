@@ -38,18 +38,23 @@ is checkable frame-by-frame against today's output.
 | area | change | per-step | gain (6 steps) | why the number |
 |---|---|---|---|---|
 | **int8 attention kernel** | our Triton int8 flash kernel in place of the kitchen `qk_int_sv_i8` | 14.9 → 9.9 (1.5×) or 7.5 (2×) | **30–44 s** | attention runs at 27% of int8 peak; both kernels do the same int8 math, so this is scheduling headroom |
-| **fp16 residual stream** | the block is degree-1 homogeneous in the residual; hold it fp16 with a fixed 1/16 fold, halving six fp32 passes, six per-token (n,5376) gathers, and the fp16↔fp32 casts | ~10.6 → ~5.5 (floor 3.9) | **~30 s** | small ops cost 10.6 s against a 3.9 s HBM floor; the excess is fp32 traffic |
+| **fp16 residual stream** (proposal, risk-gated) | the block is degree-1 homogeneous in the residual, so a 1/16 fold fits fp16 — but it rounds the residual 50× per step and clips silently above 16× the sampled peak, so it needs a clip A/B before it counts as a win | ~10.6 → ~5.5? | **~30 s if it survives the A/B** | the small-op floor itself is unverified arithmetic |
 
 Tier 2 on top of Tier 1: **~450 → ~385 s** (≈ −29% from today).
 
 Risk: the kernel may lose to the kitchen one (the selftest says so in one command — no guessing).
 The residual-stream change is invasive in the TP block and must be checked visually.
 
-## Tier 3 — needs one trace first (medium/low confidence, largest single upside)
+## Tier 3 — needs one trace first
+
+(The old "fixed ~15 s/step" premise for this tier was an artifact of a two-point fit that ignored
+quadratic attention growth — retracted; see tp_step_budget.md, retraction 3. What remains here is the
+attention-traffic question and the exchange arithmetic, both of which the trace settles.)
 
 | area | change | per-step | gain | open question |
 |---|---|---|---|---|
-| **weight residency** | the step has a token-independent F ≈ 15 s (35–60% of the step). Every rank streams its whole int8 weight set from HBM each step (~7–9 GB); pin fc1/fc2 (⅔ of bytes) and re-stage the overflow once per **job** | up to F | **30–90 s**, unknown | is the fixed term really weight bytes, or dispatch? `MMH3_TP_PHASE=1` + `tp_diag.py analyze` decides |
+| **attention tile / traffic** | if attention is K/V-traffic-bound (tp_step_budget.md), the lever is a larger query tile, which cuts K/V re-reads roughly linearly — not better scheduling of the same traffic | 14.9 → ? | up to ~15 s, unproven | the BLOCK_M sweep in `turing_attention.py --selftest` says which roofline binds |
+| ~~weight residency~~ | **retracted**: tensor parallel does not re-stage weights — each rank's half is loaded into VRAM once and `_no_block_prefetch` deliberately keeps it there, so there is nothing to pin. The bytes still have to be read from HBM every step, but that is a bandwidth property, not a staging bug | — | none | tp_step_budget.md, retraction 1 |
 | **PCIe exchange** | 6.4 s/step overlapped; if `tp_diag.py probe` finds P2P works, exchanges go direct instead of host-staged, and the copies class shrinks | 6.4 → ~4 | **~12 s** | 306 MB/rank/phase × 2 × 50 × 2 crossings cannot fit in 6.4 s — one of the two is mis-scaled; the trace's DtoH/HtoD GiB settles it |
 
 Tier 3 would put the window at **~330 s** if it delivers.

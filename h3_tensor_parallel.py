@@ -45,8 +45,10 @@ CHUNKS = max(1, int(os.environ.get("MMH3_TP_CHUNKS", "4")))
 # next block's norm1 + qkv for finished chunks, queued behind the last mlp exchange of this block
 QKV_PREFETCH = os.environ.get("MMH3_TP_QKV_PREFETCH", "1") != "0"
 # attention in the same row chunks, with each band's out_proj partial shipped as soon as it is done:
-# the D2H/H2D copies then hide behind the remaining attention instead of the short out_proj tail
-ATTN_PIPELINE = os.environ.get("MMH3_TP_ATTN_PIPELINE", "1") != "0"
+# the D2H/H2D copies then hide behind the remaining attention instead of the short out_proj tail.
+# Off by default: it changes attention semantics (queries banded, keys/values full), it is verified
+# against the sequential path offline by check_tp_attn.py, and it still owes one GPU clip A/B.
+ATTN_PIPELINE = os.environ.get("MMH3_TP_ATTN_PIPELINE", "0") != "0"
 # per-phase accounting: kernel profiles show GPU time but cannot show stalls. MMH3_TP_PHASE=1 times
 # every phase of every block on the CPU clock (MMH3_TP_PHASE_SYNC=1 additionally syncs both devices
 # around each phase, which removes overlap and yields true per-phase GPU time).
@@ -126,10 +128,18 @@ _EVENTS = {}
 def _record(dev, stream=None, key=None):
     """Record an event; with a `key` the event object is reused.
 
-    Each torch.cuda.Event() is a cudaEventCreate + cudaEventDestroy round trip through the driver.
-    The exchange used to build ~6 of them per phase per block (~600/step); reuse is safe because a
-    stream's wait captures the event's state at enqueue time, and every reusable site is re-recorded
-    only after the previous wait on it has already been enqueued.
+    Each torch.cuda.Event() is a cudaEventCreate + cudaEventDestroy round trip through the driver,
+    and the exchange built ~6 per phase per block (~600/step). Reuse is safe only where the wait
+    that consumes the event is enqueued before the next record of it:
+
+      prod    recorded, then waited immediately by the copy stream       -> safe to share per phase
+      alloc   recorded once per block, waited at the start of the block   -> safe to share per phase
+      sent    recorded per chunk, waited by recv of that same chunk       -> needs one per chunk
+      read    recorded per chunk, waited by the compute stream per chunk  -> needs one per chunk
+
+    Sharing `sent`/`read` across chunks binds every wait to the *last* chunk's record, which keeps
+    results correct but removes the chunk-by-chunk overlap the exchange exists for. The key
+    therefore carries the chunk's first row for those two.
     """
     if key is None:
         ev = torch.cuda.Event()
@@ -175,7 +185,10 @@ class _ChunkedExchange:
                     cs.wait_event(buf["read"][1 - r])
                 with torch.cuda.stream(cs):
                     buf["host"][r][a:b].copy_(parts[r], non_blocking=True)
-                sent.append(_record(dev, cs, key=("sent", phase, r)))
+                # one event per chunk: the copy-done event is waited on *later* (recv of the same
+                # chunk), so sharing one object across chunks would bind every receive to the last
+                # chunk's record and serialize the exchange
+                sent.append(_record(dev, cs, key=("sent", phase, r, a)))
         return sent
 
     def begin(self, phase, shape, dtype=torch.float16):
@@ -187,8 +200,6 @@ class _ChunkedExchange:
         buf = self._buf(phase, shape, dtype)
         buf["recv"] = [torch.empty(shape, dtype=dtype, device=d) for d in DEVICES]
         buf["alloc"] = [_record(d, key=("alloc", phase, r)) for r, d in enumerate(DEVICES)]
-        # the compute streams do not change inside a step: read them once instead of per copy
-        buf["cstream"] = [torch.cuda.current_stream(d) for d in DEVICES]
 
     def recv(self, phase, shape, rows, sent):
         """H2D of the other rank's rows; returns per-rank views, ready on each compute stream."""
@@ -203,11 +214,11 @@ class _ChunkedExchange:
                 dst = buf["recv"][r][a:b]
                 with torch.cuda.stream(cs):
                     dst.copy_(buf["host"][1 - r][a:b], non_blocking=True)
-                ev = _record(dev, cs, key=("read", phase, r))
+                ev = _record(dev, cs, key=("read", phase, r, a))
                 if b == shape[0]:
                     buf["read"][r] = ev
                     buf["recv"][r] = None  # freed on the compute stream once the block's users are queued
-                buf["cstream"][r].wait_event(ev)
+                torch.cuda.current_stream(dev).wait_event(ev)
                 out.append(dst)
         return out
 
@@ -220,20 +231,6 @@ def _chunk_segs(segs, a, b):
         if lo < hi:
             out.append((lo - a, hi - a, row[lo - sa:hi - sa] if torch.is_tensor(row) and row.dim() else row))
     return out
-
-
-def _rope_rows(rope, a, b, s):
-    """Rows [a, b) of the per-token rope table, for the row-chunked attention path.
-
-    The token axis is the one whose length is the sequence; if it cannot be found the caller
-    falls back to the sequential order rather than feeding chunks the first tokens' rope.
-    """
-    if rope is None or (a == 0 and b == s):
-        return rope
-    for dim in range(rope.dim()):
-        if rope.shape[dim] == s:
-            return rope.narrow(dim, a, b - a)
-    raise ValueError(f"rope token axis not in shape {tuple(rope.shape)} for s={s}")
 
 
 def _out_proj(rank, rows, shs, lo):
@@ -407,24 +404,47 @@ class H3TensorParallel:
             out += _lora(h, lora["attn.qkv_proj"])
         return out
 
-    def _attn(self, qkv, sh, rope, topts):
+    def _rope_qk(self, qkv, sh, rope):
+        """RMS-norm + rope the query and key projections in place (views into qkv).
+
+        Split out of _attn so the row-chunked path can rope the whole sequence exactly once and
+        then attend band by band; applying it per band would rope the same rows once per pass.
+        """
         s, heads = qkv.shape[0], sh["heads"]
-        q, k, v = qkv.split(sh["inner"], dim=-1)
-        v = v.view(s, heads, HEAD)
+        q, k, _ = qkv.split(sh["inner"], dim=-1)
         q = q.view(1, s, heads, HEAD)
         k = k.view(1, s, heads, HEAD)
         comfy.quant_ops.ck.rms_rope_split_half_(q, k, rope, sh["qn"], sh["kn"], epsilon=self.qk_eps, rot_dim=rope.shape[-3] * 2)
+        return q, k
+
+    def _attend(self, qkv, sh, topts, rows=None):
+        """Attention for query rows `rows` (all rows when None) against the full k/v in qkv.
+
+        qkv must already be roped (_rope_qk); everything here is a reshape, so calling it per band is
+        the sequential computation split by query rows -- each band still sees every key and value.
+        """
+        s, heads = qkv.shape[0], sh["heads"]
+        a, b = (0, s) if rows is None else rows
+        q, k, v = qkv.split(sh["inner"], dim=-1)
+        q = q[a:b].view(1, b - a, heads, HEAD)
+        k = k.view(1, s, heads, HEAD)
+        v = v.view(s, heads, HEAD)
         q = q[0].transpose(0, 1).unsqueeze(0)
         k = k[0].transpose(0, 1).unsqueeze(0)
         v = v.transpose(0, 1).unsqueeze(0)
         backend = _attention_backend()
         if backend is not None:
-            # (1, heads, s, HEAD) -> (s, heads * HEAD), the same layout optimized_attention returns
-            return backend(q, k, v, HEAD ** -0.5).transpose(1, 2).reshape(1, s, heads * HEAD).squeeze(0)
+            # (1, heads, b - a, HEAD) -> (b - a, heads * HEAD), the layout optimized_attention returns
+            return backend(q, k, v, HEAD ** -0.5).transpose(1, 2).reshape(b - a, heads * HEAD)
         q = AttentionTensorContainer(q)
         k = AttentionTensorContainer(k)
         v = AttentionTensorContainer(v)
         return optimized_attention(q, k, v, heads, mask=None, skip_reshape=True, transformer_options=topts).squeeze(0)
+
+    def _attn(self, qkv, sh, rope, topts):
+        """Whole-sequence attention; identical to the pre-chunking path."""
+        self._rope_qk(qkv, sh, rope)
+        return self._attend(qkv, sh, topts, None)
 
     def _mlp(self, x, sh, shift, scale, segs, lora):
         h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm2"], self.eps2), shift, scale, segs).to(torch.float16)
@@ -494,35 +514,46 @@ class H3TensorParallel:
         if qkv is None:
             with _phase("qkv"):
                 qkv = _per_rank(lambda r: self._qkv(xs[r], shs[r], mods[r][0], mods[r][1], segs[r], lo[r]))
-        # per-token tail pipelined in row chunks: out_proj -> swap -> gate -> mlp -> swap -> gate
+        # per-token tail pipelined in row chunks: attention -> out_proj -> swap -> gate -> mlp -> swap -> gate
         n = x0.shape[0]
         shape, size = (n, x0.shape[1]), -(-n // CHUNKS)
         chunks = [(a, min(a + size, n)) for a in range(0, n, size)]
         csegs = [[_chunk_segs(segs[r], a, b) for r in range(2)] for a, b in chunks]
         own_a, sent_a = [], []
+        roped = False
         pipelined = ATTN_PIPELINE and len(chunks) > 1
         if pipelined:
             # attention band by band, shipping each band's partial as soon as it is done: the D2H/H2D
-            # copies then run behind the remaining attention instead of the short out_proj tail
+            # copies then run behind the remaining attention instead of the short out_proj tail.
+            # A band slices only its *queries*: keys and values are always the full sequence, so the
+            # band attends over every token (chunking a tensor that holds q, k and v together would
+            # confine each band to itself). rope is applied once, to the whole sequence, before the
+            # loop; _attend then only reshapes.
+            with _phase("rope"):
+                _per_rank(lambda r: self._rope_qk(qkv[r], shs[r], st["rope%d" % r]))
+            roped = True
             try:
                 with _phase("xchg_begin"):
                     self.xchg.begin("attn", shape)
                 for a, b in chunks:
-                    rope_rows = tuple(_rope_rows(st["rope%d" % r], a, b, n) for r in range(2))
                     with _phase("attn"):
-                        os_chunk = _per_rank(lambda r: self._attn(qkv[r][a:b], shs[r], rope_rows[r], topts))
+                        os_chunk = _per_rank(lambda r: self._attend(qkv[r], shs[r], topts, (a, b)))
                     with _phase("out_proj"):
                         own_a.append(_per_rank(lambda r: _out_proj(r, os_chunk[r], shs, lo)))
                     with _phase("send"):
                         sent_a.append(self.xchg.send("attn", shape, (a, b), own_a[-1]))
-            except ValueError as exc:
-                logger.warning("[MultiGPU TP] row-chunked attention unavailable (%s); using the sequential order", exc)
+            except Exception as exc:
+                logger.warning("[MultiGPU TP] row-chunked attention failed (%s: %s); finishing in the sequential order",
+                               type(exc).__name__, exc)
                 own_a, sent_a, pipelined = [], [], False
             else:
                 del qkv
         if not pipelined:
+            if not roped:  # a mid-loop failure lands here with rope already applied
+                with _phase("rope"):
+                    _per_rank(lambda r: self._rope_qk(qkv[r], shs[r], st["rope%d" % r]))
             with _phase("attn"):
-                os_ = _per_rank(lambda r: self._attn(qkv[r], shs[r], st["rope%d" % r], topts))
+                os_ = _per_rank(lambda r: self._attend(qkv[r], shs[r], topts, None))
             del qkv
             with _phase("xchg_begin"):
                 self.xchg.begin("attn", shape)  # after attention: keeps the qkv peak unchanged
