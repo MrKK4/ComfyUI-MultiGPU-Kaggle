@@ -23,7 +23,11 @@ Backends:
 
 `--selftest` reports ms/call, the max-abs error against the fp32 reference, the max-abs
 difference against the kernel it would replace, and the projected s/step of attention for a
-50-block DiT. Nothing here changes behaviour unless MMH3_TP_ATTN names a backend that passes
+50-block DiT. It also prints a roofline table for each whole-config sweep: TOPS and % of the int8
+peak, GB/s of K/V traffic and % of HBM bandwidth, and the tile-size sensitivity that says which of
+the two binds. Measured on the kitchen kernel's own numbers, neither does: 27% of compute peak and
+42% of bandwidth peak at BLOCK_M=128, and a 4x tile cut that removes 4x the traffic buys only
+~10-20% -- so the remaining distance is scheduling, not a wall. Nothing here changes behaviour unless MMH3_TP_ATTN names a backend that passes
 its smoke test on this GPU; otherwise the ComfyUI call is used exactly as before.
 """
 import argparse
@@ -404,7 +408,30 @@ BACKENDS = {
 _TRITON_CONFIGS = [(64, 64, 4), (128, 64, 4), (64, 128, 4), (128, 64, 8), (64, 64, 8)]
 # int8 wants a bigger M tile: the K/V re-read per row band is what limits this kernel, and P @ V is
 # int8 so the fp16-rated register pressure is lower per row of M.
-_INT8_CONFIGS = [(128, 64, 4), (128, 128, 4), (64, 64, 4), (64, 128, 4), (128, 64, 8), (128, 128, 8)]
+# Turing int8 tensor core peak and HBM bandwidth, for the roofline printout. 65e12 MAC/s is
+# 130 TOPS: every MAC is two ops, and confusing the two is a factor-of-two error in a floor.
+T4_PEAK_MACS = 65e12
+T4_PEAK_BYTES = 320e9
+# BLOCK_M is the query-tile height; it sets how many times K and V are re-read (traffic ~ 1/BLOCK_M)
+# while leaving the MAC count fixed, so sweeping it separates the two rooflines. 256-row tiles need
+# more warps to fill: a 256x128 score tile is 32k fp32 accumulators.
+_INT8_CONFIGS = [(128, 64, 4), (128, 128, 4), (64, 64, 4), (64, 128, 4), (128, 64, 8), (128, 128, 8),
+                 (256, 64, 8), (256, 128, 8)]
+
+
+def _roofline(length, planes, dim, ms, block_m):
+    """Where a config sits against the two rooflines that could bind it.
+
+    macs, TOPS and % of the int8 peak are independent of the tile; the K/V bytes scale with
+    1/BLOCK_M (each query tile re-reads the whole K and V). If ms tracks the byte column, the
+    kernel is traffic-bound and a bigger tile is the fix; if ms stays flat while bytes fall, it is
+    not traffic, and the remaining distance to the compute floor is scheduling.
+    """
+    macs = 2 * planes * length * length * dim
+    traffic = 2 * planes * (-(-length // block_m)) * length * dim      # int8 K/V: one byte each
+    return {"ms": ms, "tops": 2 * macs / ms / 1e12, "pct_peak": macs / ms / T4_PEAK_MACS,
+            "gbs": traffic / ms / 1e9, "pct_bw": traffic / ms / T4_PEAK_BYTES,
+            "compute_floor_ms": macs / T4_PEAK_MACS * 1e3, "mem_floor_ms": traffic / T4_PEAK_BYTES * 1e3}
 
 
 # ---------------------------------------------------------------------------
@@ -556,19 +583,23 @@ def selftest(n=DEFAULT_N, heads=DEFAULT_HEADS, dim=DEFAULT_DIM, device=None, dty
             rows.append((float("inf"), name, "n/a", f"{type(exc).__name__}: {exc}"[:70]))
 
     sweets = []
+    sweeps = []
     for kernel, configs in (("triton", _TRITON_CONFIGS), ("int8", _INT8_CONFIGS)):
         if not any(c == kernel for c in candidates) or not _TRITON["loaded"]:
             continue
         runner = BACKENDS[kernel]
         best = None
+        sweep = []
         for bm, bn, nw in configs:
             try:
                 fn = lambda: runner(q, k, v, block_m=bm, block_n=bn, num_warps=nw)
                 ms = _time_ms(fn, iters=iters)
+                sweep.append((ms, bm, bn, nw))
                 if best is None or ms < best[0]:
                     best = (ms, bm, bn, nw)
             except Exception as exc:
                 rows.append((float("inf"), f"{kernel} bm{bm} bn{bn} w{nw}", "n/a", f"{type(exc).__name__}: {exc}"[:70]))
+        sweeps.append((kernel, sweep))
         if best is not None:
             ms, bm, bn, nw = best
             got = runner(qv, kv, vv, block_m=bm, block_n=bn, num_warps=nw)
@@ -591,6 +622,41 @@ def selftest(n=DEFAULT_N, heads=DEFAULT_HEADS, dim=DEFAULT_DIM, device=None, dty
                              f"({rel * 100:.2f}% of the output scale)")
         except Exception as exc:
             notes.append(f"int8 vs comfy comparison failed: {type(exc).__name__}: {exc}")
+    # roofline section: the numbers that decide what to do next about the kernel that owns 35% of
+    # a step. Print every config, not just the winner, because the *shape* of the sweep is the answer.
+    for kernel, sweep in sweeps:
+        if not sweep:
+            continue
+        notes.append("")
+        notes.append(f"{kernel} sweep at (batch 1, {heads} heads, {n} tokens, {dim} dim), "
+                     f"int8 K/V")
+        notes.append(f"  {'bm':>4s}{'bn':>5s}{'w':>3s}{'ms':>9s}{'TOPS':>8s}{'%peak':>7s}"
+                     f"{'GB/s':>8s}{'%bw':>6s}{'floor ms':>10s}  (compute/memory floors)")
+        for ms, bm, bn, nw in sorted(sweep, key=lambda r: (r[1], r[2], r[3])):
+            r = _roofline(n, heads, dim, ms, bm)
+            notes.append(f"  {bm:4d}{bn:5d}{nw:3d}{ms * 1e3:9.2f}{r['tops']:8.1f}"
+                         f"{r['pct_peak'] * 100:6.0f}%{r['gbs']:8.0f}{r['pct_bw'] * 100:5.0f}%"
+                         f"{r['compute_floor_ms']:5.0f}/{r['mem_floor_ms']:.0f}")
+        # verdict from the tile sensitivity: traffic falls as 1/BLOCK_M, MACs do not move at all
+        by_m = {}
+        for ms, bm, bn, nw in sorted(sweep, key=lambda r: r[0]):
+            by_m.setdefault(bm, ms)
+        if len(by_m) >= 2:
+            lo, hi = min(by_m), max(by_m)
+            best_lo, best_hi = by_m[lo], by_m[hi]
+            bytes_ratio = hi / lo
+            notes.append(f"  tile sensitivity: best ms at BLOCK_M {lo} is {best_lo * 1e3:.1f}, at {hi} is "
+                         f"{best_hi * 1e3:.1f} -> {best_hi / best_lo:.2f}x slower with {bytes_ratio:.0f}x the K/V traffic")
+            if best_hi / best_lo > 0.6 * bytes_ratio:
+                notes.append("  verdict: ms tracks the byte column -> traffic-bound; raise BLOCK_M further")
+            elif best_hi / best_lo < 0.25 * bytes_ratio:
+                notes.append("  verdict: ms is nearly flat in tile size while traffic falls -> NOT traffic-bound;"
+                             " the distance to the compute floor is scheduling/issue, not bandwidth")
+            else:
+                notes.append("  verdict: mixed -- some traffic sensitivity, well short of the 1/BLOCK_M slope")
+            notes.append(f"  (the kitchen kernel's own 64->128 tile gain was 10-12%, while its traffic halves:"
+                         f" that measurement already argues against traffic being what binds)")
+
     if device.type == "cuda":
         # which kernel did the baseline actually run, and is the new one a drop-in for the 335 ms
         # you measured for qk_int_sv_i8 at 28.5k tokens?
