@@ -25,10 +25,16 @@ and how confident the number is.
 
 Tier 1 alone: **542 → ~450 s** (≈ −17%), and none of it touches model math, so quality cannot move.
 
-**Status: SAM batching is built** — `sam3_fast.py`, on by default (`MMH3_SAM_FAST=0` disables), with
-`check_sam_fast.py` proving both rewritten paths decision-identical to upstream on random masks.
-The Qwen cache split and the CPU threading are not started. Expected SAM saving is 27–37 s; the
-before/after is `sam_fast.txt` plus the existing `sam_profile.request` profiler.
+**Status of Tier 1:**
+
+| item | state | how to A/B |
+|---|---|---|
+| SAM 3.1 batching | **built** — `sam3_fast.py`, on by default (`MMH3_SAM_FAST=0` disables); `check_sam_fast.py` proves both rewritten paths decision-identical to upstream on random masks | `sam_fast.txt` + `sam_profile.request`, against a `MMH3_SAM_FAST=0` run |
+| Qwen3-VL ViT/LLM split | **built** — `h3_qwen_cache.py`, on by default (`MMH3_QWEN_CACHE=0` disables); keys on the pixels, so a prompt tweak reuses the vision tower; `check_h3_qwen_cache.py` proves cache integrity under aliasing on both hit and miss paths | `h3_qwen_cache.txt` reports hits and tower seconds skipped |
+| post-decode chain | **built** — `post_gpu.py`, **off** by default (`MMH3_POST_GPU=1` or `touch post_gpu.request`); redirects `intermediate_device()` to the GPU with a VRAM floor and cached query; `check_post_gpu.py` proves the fallbacks | `post_gpu.txt` + a run without the flag |
+
+Expected: SAM 27–37 s, Qwen ~39–44 s when the prompt repeats, post chain ~20–30 s of the 40 s CPU
+time (the MP4 encode itself stays on the CPU). All three need one GPU run to confirm.
 
 Downside risk: low everywhere. The only real risk is the SAM rewrite changing a mask edge, which
 is checkable frame-by-frame against today's output.
@@ -37,7 +43,7 @@ is checkable frame-by-frame against today's output.
 
 | area | change | per-step | gain (6 steps) | why the number |
 |---|---|---|---|---|
-| **int8 attention kernel** | our Triton int8 flash kernel in place of the kitchen `qk_int_sv_i8` | 14.9 → 9.9 (1.5×) or 7.5 (2×) | **30–44 s** | attention runs at 27% of int8 peak; both kernels do the same int8 math, so this is scheduling headroom |
+| **int8 attention kernel** | our Triton int8 flash kernel in place of the kitchen `qk_int_sv_i8` — but first read the roofline table the selftest now prints | 14.9 → 9.9 (1.5×) or 7.5 (2×) | **30–44 s** *if* it wins | it runs at 27% of int8 compute peak and 42% of bandwidth peak, and a 4× tile cut buys only 10–20%: neither wall binds, so the headroom is scheduling — worth measuring, not assuming |
 | **fp16 residual stream** (proposal, risk-gated) | the block is degree-1 homogeneous in the residual, so a 1/16 fold fits fp16 — but it rounds the residual 50× per step and clips silently above 16× the sampled peak, so it needs a clip A/B before it counts as a win | ~10.6 → ~5.5? | **~30 s if it survives the A/B** | the small-op floor itself is unverified arithmetic |
 
 Tier 2 on top of Tier 1: **~450 → ~385 s** (≈ −29% from today).
