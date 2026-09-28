@@ -17,6 +17,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 
 import torch
 from safetensors import safe_open
@@ -43,10 +44,99 @@ _SHARD_CACHE = {}
 CHUNKS = max(1, int(os.environ.get("MMH3_TP_CHUNKS", "4")))
 # next block's norm1 + qkv for finished chunks, queued behind the last mlp exchange of this block
 QKV_PREFETCH = os.environ.get("MMH3_TP_QKV_PREFETCH", "1") != "0"
+# attention in the same row chunks, with each band's out_proj partial shipped as soon as it is done:
+# the D2H/H2D copies then hide behind the remaining attention instead of the short out_proj tail
+ATTN_PIPELINE = os.environ.get("MMH3_TP_ATTN_PIPELINE", "1") != "0"
+# per-phase accounting: kernel profiles show GPU time but cannot show stalls. MMH3_TP_PHASE=1 times
+# every phase of every block on the CPU clock (MMH3_TP_PHASE_SYNC=1 additionally syncs both devices
+# around each phase, which removes overlap and yields true per-phase GPU time).
+PHASE_DIAG = os.environ.get("MMH3_TP_PHASE", "0") != "0"
+PHASE_SYNC = os.environ.get("MMH3_TP_PHASE_SYNC", "0") != "0"
+PHASE_STEPS = max(1, int(os.environ.get("MMH3_TP_PHASE_STEPS", "1")))
+PHASE_SKIP = int(os.environ.get("MMH3_TP_PHASE_SKIP", "1"))
+PHASE_FILE = "tp_phase.txt"
+_PHASE_ACC = defaultdict(float)
+_PHASE_STEP = 0
+_PHASE_ACTIVE = False
+_PHASE_FORWARD = 0
 
 
-def _record(dev, stream=None):
-    ev = torch.cuda.Event()
+@contextmanager
+def _phase(name):
+    """One phase of a block: CPU wall, or true GPU time when MMH3_TP_PHASE_SYNC=1."""
+    if not _PHASE_ACTIVE:
+        yield
+        return
+    if PHASE_SYNC:
+        for dev in DEVICES:
+            torch.cuda.synchronize(dev)
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        if PHASE_SYNC:
+            for dev in DEVICES:
+                torch.cuda.synchronize(dev)
+        _PHASE_ACC[name] += time.perf_counter() - start
+
+
+def _phase_report(blocks):
+    """Write the per-phase accounting for the step just measured."""
+    total = _PHASE_ACC.get("block_wall", 0.0)
+    lines = [f"tp_phase step {_PHASE_STEP}: {blocks} blocks, in-block wall {total:.2f}s, "
+             f"CHUNKS={CHUNKS}, attention_pipeline={'on' if ATTN_PIPELINE else 'off'}, "
+             f"sync={'on (true GPU time, overlap removed)' if PHASE_SYNC else 'off (CPU wall)'}"]
+    for name, seconds in sorted(_PHASE_ACC.items(), key=lambda kv: -kv[1]):
+        if name == "block_wall":
+            continue
+        share = f"{seconds / total * 100:5.1f}%" if total else "  n/a"
+        lines.append(f"  {name:14s} {seconds:8.2f}s {share}  {seconds / max(1, blocks) * 1000:7.1f} ms/block")
+    named = {k: v for k, v in _PHASE_ACC.items() if k != "block_wall"}
+    busy = sum(named.values())
+    peak = max(named.values(), default=0.0)
+    lines.append(f"  phases sum to {busy:.2f}s of the {total:.2f}s in-block wall "
+                 f"({busy / total * 100:.1f}%; the rest is un-instrumented code inside block())")
+    lines.append(f"  largest single phase: {peak:.2f}s. Per device that is {peak / 2:.2f}s if both ranks "
+                 f"carry it, or {peak:.2f}s on one device if the other is waiting on it")
+    lines.append(f"  compare with the sampler's own step time: in-block wall {total:.2f}s is how much of "
+                 f"it is inside the DiT blocks; the remainder is outside them")
+    if PHASE_SYNC:
+        lines.append("  SYNC=1: every phase was fenced on both devices, so these are true GPU times "
+                     "(overlap between the two ranks is removed - a phase can look ~2x its cost here)")
+        lines.append("  verdict: run the same step with SYNC=0; phases that shrink a lot when unfenced "
+                     "were GPU-limited, phases that stay the same are CPU-limited (issuing)")
+    else:
+        lines.append("  verdict: these are CPU-side issue times (kernels are queued asynchronously, so a "
+                     "fast phase means the CPU queued it fast, not that the GPU finished it)")
+        lines.append("  now run the same step with MMH3_TP_PHASE_SYNC=1: a phase whose CPU time is much "
+                     "larger than its GPU time is CPU-bound (fewer/faster calls to make); a phase whose "
+                     "GPU time is close to its CPU time is GPU-bound (fewer/cheaper kernels to make)")
+    text = "\n".join(lines)
+    logger.info("[MultiGPU TP phase] %s", lines[0])
+    try:
+        with open(PHASE_FILE, "a", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+    except OSError:
+        pass
+
+
+_EVENTS = {}
+
+
+def _record(dev, stream=None, key=None):
+    """Record an event; with a `key` the event object is reused.
+
+    Each torch.cuda.Event() is a cudaEventCreate + cudaEventDestroy round trip through the driver.
+    The exchange used to build ~6 of them per phase per block (~600/step); reuse is safe because a
+    stream's wait captures the event's state at enqueue time, and every reusable site is re-recorded
+    only after the previous wait on it has already been enqueued.
+    """
+    if key is None:
+        ev = torch.cuda.Event()
+    else:
+        ev = _EVENTS.get(key)
+        if ev is None:
+            ev = _EVENTS[key] = torch.cuda.Event()
     ev.record(stream if stream is not None else torch.cuda.current_stream(dev))
     return ev
 
@@ -80,19 +170,25 @@ class _ChunkedExchange:
         for r, dev in enumerate(DEVICES):
             with torch.cuda.device(dev):
                 cs = self.copy[r]
-                cs.wait_event(_record(dev))
+                cs.wait_event(_record(dev, key=("prod", phase, r)))
                 if a == 0 and buf["read"][1 - r] is not None:
                     cs.wait_event(buf["read"][1 - r])
                 with torch.cuda.stream(cs):
                     buf["host"][r][a:b].copy_(parts[r], non_blocking=True)
-                sent.append(_record(dev, cs))
+                sent.append(_record(dev, cs, key=("sent", phase, r)))
         return sent
 
     def begin(self, phase, shape, dtype=torch.float16):
-        """Per-block receive buffers, allocated on the compute streams before any copy is queued."""
+        """Per-block receive buffers, allocated on the compute streams before any copy is queued.
+
+        Calling it twice for the same block (the pipelined path's fallback does) is harmless: the
+        first pair of buffers is dropped before anything read them and the allocator reuses it.
+        """
         buf = self._buf(phase, shape, dtype)
         buf["recv"] = [torch.empty(shape, dtype=dtype, device=d) for d in DEVICES]
-        buf["alloc"] = [_record(d) for d in DEVICES]
+        buf["alloc"] = [_record(d, key=("alloc", phase, r)) for r, d in enumerate(DEVICES)]
+        # the compute streams do not change inside a step: read them once instead of per copy
+        buf["cstream"] = [torch.cuda.current_stream(d) for d in DEVICES]
 
     def recv(self, phase, shape, rows, sent):
         """H2D of the other rank's rows; returns per-rank views, ready on each compute stream."""
@@ -107,11 +203,11 @@ class _ChunkedExchange:
                 dst = buf["recv"][r][a:b]
                 with torch.cuda.stream(cs):
                     dst.copy_(buf["host"][1 - r][a:b], non_blocking=True)
-                ev = _record(dev, cs)
+                ev = _record(dev, cs, key=("read", phase, r))
                 if b == shape[0]:
                     buf["read"][r] = ev
                     buf["recv"][r] = None  # freed on the compute stream once the block's users are queued
-                torch.cuda.current_stream(dev).wait_event(ev)
+                buf["cstream"][r].wait_event(ev)
                 out.append(dst)
         return out
 
@@ -123,6 +219,29 @@ def _chunk_segs(segs, a, b):
         lo, hi = max(sa, a), min(sb, b)
         if lo < hi:
             out.append((lo - a, hi - a, row[lo - sa:hi - sa] if torch.is_tensor(row) and row.dim() else row))
+    return out
+
+
+def _rope_rows(rope, a, b, s):
+    """Rows [a, b) of the per-token rope table, for the row-chunked attention path.
+
+    The token axis is the one whose length is the sequence; if it cannot be found the caller
+    falls back to the sequential order rather than feeding chunks the first tokens' rope.
+    """
+    if rope is None or (a == 0 and b == s):
+        return rope
+    for dim in range(rope.dim()):
+        if rope.shape[dim] == s:
+            return rope.narrow(dim, a, b - a)
+    raise ValueError(f"rope token axis not in shape {tuple(rope.shape)} for s={s}")
+
+
+def _out_proj(rank, rows, shs, lo):
+    """One row band's out_proj partial: 1/S-scaled fp16 input, shard plus the LoRA side path."""
+    xs_ = rows * (1.0 / S)
+    out = _lin(xs_, shs[rank]["out"])
+    if "attn.out_proj" in lo[rank]:
+        out += _lora(xs_, lo[rank]["attn.out_proj"])  # partial sum, same 1/S-scaled space as the shard's
     return out
 
 
@@ -219,6 +338,24 @@ def _lora(x, pair):
     return torch.nn.functional.linear(torch.nn.functional.linear(x, pair[0]), pair[1])
 
 
+_ATTN_BACKEND = None
+_ATTN_BACKEND_RESOLVED = False
+
+
+def _attention_backend():
+    """Optional faster attention backend (see turing_attention.py); None keeps the ComfyUI call."""
+    global _ATTN_BACKEND, _ATTN_BACKEND_RESOLVED
+    if not _ATTN_BACKEND_RESOLVED:
+        _ATTN_BACKEND_RESOLVED = True
+        try:
+            from .turing_attention import selected_backend
+            _ATTN_BACKEND = selected_backend()
+        except Exception as exc:
+            logger.debug("[MultiGPU TP] attention backend unavailable: %s", exc)
+            _ATTN_BACKEND = None
+    return _ATTN_BACKEND
+
+
 class H3TensorParallel:
     def __init__(self, path, diffusion_model):
         self.path = path
@@ -277,9 +414,16 @@ class H3TensorParallel:
         q = q.view(1, s, heads, HEAD)
         k = k.view(1, s, heads, HEAD)
         comfy.quant_ops.ck.rms_rope_split_half_(q, k, rope, sh["qn"], sh["kn"], epsilon=self.qk_eps, rot_dim=rope.shape[-3] * 2)
-        q = AttentionTensorContainer(q[0].transpose(0, 1).unsqueeze(0))
-        k = AttentionTensorContainer(k[0].transpose(0, 1).unsqueeze(0))
-        v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
+        q = q[0].transpose(0, 1).unsqueeze(0)
+        k = k[0].transpose(0, 1).unsqueeze(0)
+        v = v.transpose(0, 1).unsqueeze(0)
+        backend = _attention_backend()
+        if backend is not None:
+            # (1, heads, s, HEAD) -> (s, heads * HEAD), the same layout optimized_attention returns
+            return backend(q, k, v, HEAD ** -0.5).transpose(1, 2).reshape(1, s, heads * HEAD).squeeze(0)
+        q = AttentionTensorContainer(q)
+        k = AttentionTensorContainer(k)
+        v = AttentionTensorContainer(v)
         return optimized_attention(q, k, v, heads, mask=None, skip_reshape=True, transformer_options=topts).squeeze(0)
 
     def _mlp(self, x, sh, shift, scale, segs, lora):
@@ -316,10 +460,17 @@ class H3TensorParallel:
         return st
 
     def block(self, i, args, original):
+        global _PHASE_ACTIVE, _PHASE_STEP, _PHASE_FORWARD
         d0, d1 = DEVICES
+        if PHASE_DIAG and i == 0:
+            _PHASE_FORWARD += 1
+            if _PHASE_FORWARD > PHASE_SKIP and _PHASE_STEP < PHASE_STEPS:
+                _PHASE_ACC.clear()
+                _PHASE_ACTIVE = True
+        t_block = time.perf_counter() if _PHASE_ACTIVE else None
         if self.shards is None:
             # permanent allocations: keep them out of the compiler's per-forward allocation graph
-            with comfy.model_prefetch.pause_malloc_graph(sync=True):
+            with _phase("shard_load"), comfy.model_prefetch.pause_malloc_graph(sync=True):
                 self.shards = _load_shards(self.path, len(self.blocks))
         blk = self.blocks[i]
         x0 = args["img"].float()
@@ -331,67 +482,97 @@ class H3TensorParallel:
         if pre is not None and pre[0] == i:
             _, mods0, mods1, qkv = pre
         else:
-            mods0, mods1 = self._mods(i, args["t_emb"])
+            with _phase("mods"):
+                mods0, mods1 = self._mods(i, args["t_emb"])
             qkv = None
         ref = None
         if not self.checked:
-            ref = original({**args, "img": args["img"].clone()})["img"].float()
+            with _phase("ref_check"):
+                ref = original({**args, "img": args["img"].clone()})["img"].float()
 
         xs, shs, mods, segs = (x0, x1), (sh0, sh1), (mods0, mods1), (segs0, segs1)
         if qkv is None:
-            qkv = _per_rank(lambda r: self._qkv(xs[r], shs[r], mods[r][0], mods[r][1], segs[r], lo[r]))
-        os_ = _per_rank(lambda r: self._attn(qkv[r], shs[r], st["rope%d" % r], topts))
-        del qkv
+            with _phase("qkv"):
+                qkv = _per_rank(lambda r: self._qkv(xs[r], shs[r], mods[r][0], mods[r][1], segs[r], lo[r]))
         # per-token tail pipelined in row chunks: out_proj -> swap -> gate -> mlp -> swap -> gate
         n = x0.shape[0]
         shape, size = (n, x0.shape[1]), -(-n // CHUNKS)
         chunks = [(a, min(a + size, n)) for a in range(0, n, size)]
         csegs = [[_chunk_segs(segs[r], a, b) for r in range(2)] for a, b in chunks]
-        self.xchg.begin("attn", shape)  # after attention: keeps the qkv peak unchanged
         own_a, sent_a = [], []
-        for a, b in chunks:
-            def out_proj(r):
-                xs_ = os_[r][a:b] * (1.0 / S)
-                out = _lin(xs_, shs[r]["out"])
-                if "attn.out_proj" in lo[r]:
-                    out += _lora(xs_, lo[r]["attn.out_proj"])  # partial sum, same 1/S-scaled space as the shard's
-                return out
-            own_a.append(_per_rank(out_proj))
-            sent_a.append(self.xchg.send("attn", shape, (a, b), own_a[-1]))
-        del os_
-        self.xchg.begin("mlp", shape)
+        pipelined = ATTN_PIPELINE and len(chunks) > 1
+        if pipelined:
+            # attention band by band, shipping each band's partial as soon as it is done: the D2H/H2D
+            # copies then run behind the remaining attention instead of the short out_proj tail
+            try:
+                with _phase("xchg_begin"):
+                    self.xchg.begin("attn", shape)
+                for a, b in chunks:
+                    rope_rows = tuple(_rope_rows(st["rope%d" % r], a, b, n) for r in range(2))
+                    with _phase("attn"):
+                        os_chunk = _per_rank(lambda r: self._attn(qkv[r][a:b], shs[r], rope_rows[r], topts))
+                    with _phase("out_proj"):
+                        own_a.append(_per_rank(lambda r: _out_proj(r, os_chunk[r], shs, lo)))
+                    with _phase("send"):
+                        sent_a.append(self.xchg.send("attn", shape, (a, b), own_a[-1]))
+            except ValueError as exc:
+                logger.warning("[MultiGPU TP] row-chunked attention unavailable (%s); using the sequential order", exc)
+                own_a, sent_a, pipelined = [], [], False
+            else:
+                del qkv
+        if not pipelined:
+            with _phase("attn"):
+                os_ = _per_rank(lambda r: self._attn(qkv[r], shs[r], st["rope%d" % r], topts))
+            del qkv
+            with _phase("xchg_begin"):
+                self.xchg.begin("attn", shape)  # after attention: keeps the qkv peak unchanged
+            for a, b in chunks:
+                with _phase("out_proj"):
+                    own_a.append(_per_rank(lambda r: _out_proj(r, os_[r][a:b], shs, lo)))
+                with _phase("send"):
+                    sent_a.append(self.xchg.send("attn", shape, (a, b), own_a[-1]))
+            del os_
+        with _phase("xchg_begin"):
+            self.xchg.begin("mlp", shape)
         own_m, sent_m = [], []
         for j, (a, b) in enumerate(chunks):
-            got = self.xchg.recv("attn", shape, (a, b), sent_a[j])
+            with _phase("recv"):
+                got = self.xchg.recv("attn", shape, (a, b), sent_a[j])
 
             def attn_then_mlp(r):
                 xc = xs[r][a:b]
                 h3._mod_gate(xc, mods[r][2], (own_a[j][r] + got[r]).float() * S, csegs[j][r])
                 own_a[j][r] = None
                 return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r], lo[r])
-            own_m.append(_per_rank(attn_then_mlp))
-            sent_m.append(self.xchg.send("mlp", shape, (a, b), own_m[j]))
+            with _phase("gate_mlp"):
+                own_m.append(_per_rank(attn_then_mlp))
+            with _phase("send"):
+                sent_m.append(self.xchg.send("mlp", shape, (a, b), own_m[j]))
         nxt = i + 1 if QKV_PREFETCH and i + 1 < len(self.blocks) and ref is None and n < self.prefetch_oom_n else None
         if nxt is not None:
-            nmods = self._mods(nxt, args["t_emb"])
+            with _phase("prefetch_mods"):
+                nmods = self._mods(nxt, args["t_emb"])
             nsh = (self.shards[0][nxt], self.shards[1][nxt])
             nlo = self._block_lora(nxt)
             try:
-                nqkv = _per_rank(lambda r: torch.empty((n, 3 * nsh[r]["inner"]), dtype=torch.float16, device=DEVICES[r]))
+                with _phase("prefetch_alloc"):
+                    nqkv = _per_rank(lambda r: torch.empty((n, 3 * nsh[r]["inner"]), dtype=torch.float16, device=DEVICES[r]))
             except torch.OutOfMemoryError:
                 # long sequences (~100k tokens): the extra qkv buffer does not fit next to this block's partials
                 self.prefetch_oom_n = n
                 logger.info(f"[MultiGPU TP] qkv prefetch off for {n}+ tokens (out of memory)")
                 nxt = None
         for j, (a, b) in enumerate(chunks):
-            got = self.xchg.recv("mlp", shape, (a, b), sent_m[j])
+            with _phase("recv"):
+                got = self.xchg.recv("mlp", shape, (a, b), sent_m[j])
 
             def gate_then_next_qkv(r):
                 xc = xs[r][a:b]
                 h3._mod_gate(xc, mods[r][5], (own_m[j][r] + got[r]).float() * S, csegs[j][r])
                 if nxt is not None:
                     nqkv[r][a:b] = self._qkv(xc, nsh[r], nmods[r][0], nmods[r][1], csegs[j][r], nlo[r])
-            _per_rank(gate_then_next_qkv)
+            with _phase("gate_next_qkv"):
+                _per_rank(gate_then_next_qkv)
             own_m[j] = None
         if nxt is not None:
             st["pre"] = (nxt, nmods[0], nmods[1], nqkv)
@@ -402,6 +583,12 @@ class H3TensorParallel:
             drift = float((x0 - x1.to(d0)).abs().max())
             logger.info(f"[MultiGPU TP] block {i} check: rel err vs single-GPU {rel:.2e}, replica drift {drift:.2e}")
         st["x0"], st["x1"] = x0, x1
+        if t_block is not None:
+            _PHASE_ACC["block_wall"] += time.perf_counter() - t_block
+            if i == len(self.blocks) - 1:
+                _PHASE_ACTIVE = False
+                _PHASE_STEP += 1
+                _phase_report(len(self.blocks))
         return {"img": x0}
 
 
