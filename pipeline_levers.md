@@ -108,3 +108,13 @@ more there and Tier 1 about the same.
    hypothesis; if it confirms weight bytes, residency is the biggest single remaining item.
 4. **fp16 residual stream** last of the sampler work, because it is the most invasive for a ~30 s
    return.
+
+## Outside this plan
+
+`research_findings.md` (same branch) surveys the published numbers for eight out-of-tree options —
+SAM 3.1, SM75 attention kernels, step caching, the Qwen encoder, PipeFusion/xDiT, sparse attention,
+Turing small-op fusion and hardware/cloud economics. Two items there are worth testing outside this
+plan: **FirstBlockCache for H3** (already ported from NVIDIA's reference, "the reference's dominant
+2.58× stage", but 6 turbo steps is the hard case for it) and **sparse attention on sm_75** (two
+candidate backends; attention is 35% of a step). Everything else in that survey is either already
+done here, architecture-ineligible on Turing, or unmeasured on a T4.
