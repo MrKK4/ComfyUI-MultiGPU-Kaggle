@@ -20,6 +20,8 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
+from .h3_vae_tiles import reserve_extra_tiles
+
 logger = logging.getLogger("MultiGPU")
 _orig_decode_temporal = hv.MiniMaxH3VideoVAE.decode_temporal
 _orig_encode_temporal = hv.MiniMaxH3VideoVAE.encode_temporal
@@ -36,6 +38,7 @@ def _clips(vae, z):
 def _decode_on(helper, clip_z, home, out, err):
     try:
         dev = helper.device
+        reserve_extra_tiles(dev)          # spatial tile batching wants room before it starts
         # grad mode is thread-local: ComfyUI runs nodes under inference_mode on its own thread only
         with torch.inference_mode(), torch.cuda.device(dev):
             dec = helper.first_stage_model._adaptive_decode(clip_z.to(dev))
@@ -172,6 +175,7 @@ class VAEDecodeH3DualGPU:
             fsm._mmh3_helper = helper
         else:
             logger.info("[MultiGPU] VAEDecodeH3DualGPU: single-device decode (not H3 video, or helper on the VAE's device)")
+        reserve_extra_tiles(vae.device)
         try:
             images = vae.decode(latent)
         finally:

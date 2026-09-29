@@ -22,6 +22,7 @@ from .h3_qwen_cache import patch_h3_qwen_cache
 from .sam3_profile import patch_sam3_profile
 from .post_gpu import patch_post_gpu
 from .sam3_fast import patch_sam3_fast
+from .h3_vae_tiles import patch_h3_vae_tiles, reserve_extra_tiles
 from .tp_diag import patch_tp_diag
 from .ltx_vae_lowmem import patch_ltx_vae_lowmem
 from .h3_tensor_parallel import UNETLoaderH3TensorParallel
@@ -619,6 +620,7 @@ patch_h3_qwen_cache()
 patch_sam3_profile()
 patch_post_gpu()
 patch_sam3_fast()
+patch_h3_vae_tiles()
 patch_tp_diag()
 patch_ltx_vae_lowmem()
 _initialize_aimdo_visible_cuda_devices()
