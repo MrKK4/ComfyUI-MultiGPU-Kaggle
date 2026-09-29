@@ -11,6 +11,15 @@ logger = logging.getLogger("MultiGPU")
 FLAG = "sam_profile.request"
 
 
+def _log_memory(stage):
+    stats = []
+    for device in range(min(torch.cuda.device_count(), 2)):
+        stats.append("cuda:%d allocated=%.2f GiB reserved=%.2f GiB" % (
+            device, torch.cuda.memory_allocated(device) / 2**30,
+            torch.cuda.memory_reserved(device) / 2**30))
+    logger.info("[MultiGPU SAM3] %s: %s", stage, "; ".join(stats))
+
+
 def patch_sam3_profile():
     import nodes
     # ComfyUI loads its built-in node files under an internal module name, so patch the registered class
@@ -22,23 +31,31 @@ def patch_sam3_profile():
     execute = node.execute.__func__
 
     def profiled(cls, *args, **kwargs):
-        # a face swap's step 2 leaves the TP shards (~10 GB, not ComfyUI-managed) plus the helper VAE copies on
-        # cuda:0; SAM's tracking memory then grows past the card late in the clip (OOM at 13.1 GiB). Unload the
-        # ComfyUI-managed models first, as the TP sampler does; they reload in seconds from RAM.
+        # Face swap step 2 leaves TP shards on cuda:0. ComfyUI cannot unload them, and SAM's tracking memory
+        # grows over the clip. Release them before tracking, so an OOM cannot retain a failed tracker attempt.
         import comfy.model_management as mm
+        from .h3_tensor_parallel import release_gpu
+        _log_memory("before cleanup")
         mm.free_memory(1e30, torch.device("cuda", 0))
+        _log_memory("after ComfyUI cleanup")
+        release_gpu(drop_shards=True)
         mm.soft_empty_cache()
+        _log_memory("after TP release")
         if not os.path.exists(FLAG):
             try:
-                return execute(cls, *args, **kwargs)
+                result = execute(cls, *args, **kwargs)
+                _log_memory("after SAM tracking")
+                return result
             except torch.OutOfMemoryError:
+                _log_memory("after SAM OOM")
                 pass  # retried below, outside the handler, so the failed attempt's tensors are released first
-            # SAM's tracking memory grows with every re-detected object; the TP shards (~10 GB) are what is left
-            from .h3_tensor_parallel import release_gpu
-            logger.warning("[MultiGPU] SAM3 out of memory next to the TP shards; releasing them and retrying")
+            logger.warning("[MultiGPU] SAM3 out of memory after pre-tracking cleanup; retrying once")
             release_gpu(drop_shards=True)
             mm.soft_empty_cache()
-            return execute(cls, *args, **kwargs)
+            _log_memory("before SAM retry")
+            result = execute(cls, *args, **kwargs)
+            _log_memory("after SAM retry")
+            return result
         os.remove(FLAG)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
