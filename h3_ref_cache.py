@@ -9,9 +9,18 @@ videos or audio are not cached. Disable with MMH3_REF_CACHE=0."""
 import hashlib
 import logging
 import os
-import weakref
 
 logger = logging.getLogger("MultiGPU")
+
+
+def _fingerprint(obj, attr):
+    # ComfyUI re-runs the loaders whenever another workflow (face swap step 1) ran in between, so the same
+    # files come back as new objects; key on the weights' names/shapes/dtypes instead of object identity.
+    # ponytail: two fine-tunes with identical layout and dtype would collide; hash a weight if that ever matters.
+    model = getattr(obj, attr, None) if obj is not None else None
+    if model is None:
+        return None
+    return hashlib.sha1(repr([(k, tuple(v.shape), str(v.dtype)) for k, v in model.state_dict().items()]).encode()).hexdigest()
 
 
 def patch_minimax_h3_ref_cache():
@@ -29,7 +38,7 @@ def patch_minimax_h3_ref_cache():
         return True
     execute = node.execute.__func__
     # ponytail: one entry (the last prompt + face); keep several if people alternate faces.
-    # The encoders are held weakly: a hit needs the very same loaded objects, and the cache never keeps a model alive.
+    # The encoders enter the key by fingerprint only, so the cache never keeps a model alive.
     cache = {}
 
     def cached_execute(cls, clip, prompt, width, height, length, ref_image_size="match", vae=None, audio_vae=None,
@@ -39,14 +48,15 @@ def patch_minimax_h3_ref_cache():
                            ref_images, ref_videos, ref_video_audios, ref_audios)
         images = [img for img in (ref_images or {}).values() if img is not None]
         key = (prompt, ref_image_size, (width, height) if ref_image_size == "match" else None,
-               tuple((tuple(img.shape), hashlib.sha1(img[:1].contiguous().cpu().numpy().tobytes()).hexdigest()) for img in images))
-        if cache.get("key") == key and cache["clip"]() is clip and cache["vae"]() is vae:
+               tuple((tuple(img.shape), hashlib.sha1(img[:1].contiguous().cpu().numpy().tobytes()).hexdigest()) for img in images),
+               _fingerprint(clip, "cond_stage_model"), _fingerprint(vae, "first_stage_model"))
+        if cache.get("key") == key:
             logger.info("[MultiGPU] H3 Ref2VA: reusing the cached prompt + reference encode")
             latent, _ = nm._empty_av_latent(width, height, length)
             return io.NodeOutput(cache["cond"], latent)
         out = execute(cls, clip, prompt, width, height, length, ref_image_size, vae, audio_vae,
                       ref_images, ref_videos, ref_video_audios, ref_audios)
-        cache.update(key=key, clip=weakref.ref(clip), vae=weakref.ref(vae) if vae is not None else (lambda: None), cond=out.args[0])
+        cache.update(key=key, cond=out.args[0])
         return out
 
     node.execute = classmethod(cached_execute)
