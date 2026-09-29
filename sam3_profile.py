@@ -22,6 +22,12 @@ def patch_sam3_profile():
     execute = node.execute.__func__
 
     def profiled(cls, *args, **kwargs):
+        # a face swap's step 2 leaves the TP shards (~10 GB, not ComfyUI-managed) plus the helper VAE copies on
+        # cuda:0; SAM's tracking memory then grows past the card late in the clip (OOM at 13.1 GiB). Unload the
+        # ComfyUI-managed models first, as the TP sampler does; they reload in seconds from RAM.
+        import comfy.model_management as mm
+        mm.free_memory(1e30, torch.device("cuda", 0))
+        mm.soft_empty_cache()
         if not os.path.exists(FLAG):
             return execute(cls, *args, **kwargs)
         os.remove(FLAG)
