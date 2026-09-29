@@ -219,7 +219,30 @@ def _lora(x, pair):
     return torch.nn.functional.linear(torch.nn.functional.linear(x, pair[0]), pair[1])
 
 
+# One instance per checkpoint: a ComfyUI cache reset (the studio frees host RAM after each face swap) re-runs the
+# loader, and without this every job would re-shard ~20 GB (~80 s) while the old shards wait for garbage collection.
+_INSTANCES = {}
+
+
+def release_gpu(drop_shards=False):
+    """Free the exchange buffers (device receive + pinned host) and, with drop_shards, the shards themselves
+    (re-read on the next sampling run) so another model (SAM 3.1) can use the VRAM."""
+    for tp in _INSTANCES.values():
+        tp.release(drop_shards)
+
+
 class H3TensorParallel:
+    def release(self, drop_shards=False):
+        for d in DEVICES:
+            torch.cuda.synchronize(d)
+        self.xchg.bufs.clear()
+        if drop_shards and self.shards is not None:
+            self.shards = None
+            logger.warning("[MultiGPU TP] shards released to make room; the next sampling run re-shards them")
+        for d in DEVICES:
+            with torch.cuda.device(d):
+                torch.cuda.empty_cache()
+
     def __init__(self, path, diffusion_model):
         self.path = path
         self.blocks = diffusion_model.blocks
@@ -447,7 +470,10 @@ def _prepare_sampling(tp, executor, *args, **kwargs):
     comfy.model_management.free_memory(1e30, DEVICES[0])
     # the guider's patcher carries any LoRA added after this loader (LoraLoaderModelOnly etc.)
     tp.set_lora(executor.class_obj.model_patcher.patches)
-    return executor(*args, **kwargs)
+    try:
+        return executor(*args, **kwargs)
+    finally:
+        tp.release()  # ~0.6 GB of receive buffers per card and ~1.2 GB pinned host per token count
 
 
 class UNETLoaderH3TensorParallel:
@@ -470,7 +496,11 @@ class UNETLoaderH3TensorParallel:
         # the Comfy compiler records one device's allocations per forward; TP allocates on two.
         # ponytail: process-wide, Split in the same session runs without the compiler
         comfy.cli_args.args.disable_comfy_compiler = True
-        tp = H3TensorParallel(path, dm)
+        tp = _INSTANCES.get(path)
+        if tp is None:
+            tp = _INSTANCES[path] = H3TensorParallel(path, dm)
+        else:
+            tp.blocks = dm.blocks  # shards stay; norms/adaln come from the freshly loaded model
         for i in range(len(dm.blocks)):
             model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
                                           "dit", "double_block", i)

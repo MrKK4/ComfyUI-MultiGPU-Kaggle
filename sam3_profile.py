@@ -29,6 +29,15 @@ def patch_sam3_profile():
         mm.free_memory(1e30, torch.device("cuda", 0))
         mm.soft_empty_cache()
         if not os.path.exists(FLAG):
+            try:
+                return execute(cls, *args, **kwargs)
+            except torch.OutOfMemoryError:
+                pass  # retried below, outside the handler, so the failed attempt's tensors are released first
+            # SAM's tracking memory grows with every re-detected object; the TP shards (~10 GB) are what is left
+            from .h3_tensor_parallel import release_gpu
+            logger.warning("[MultiGPU] SAM3 out of memory next to the TP shards; releasing them and retrying")
+            release_gpu(drop_shards=True)
+            mm.soft_empty_cache()
             return execute(cls, *args, **kwargs)
         os.remove(FLAG)
         torch.cuda.synchronize()
