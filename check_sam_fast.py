@@ -57,6 +57,25 @@ class fake_cv2:
         return n + 1, labeled, _Stats(labeled, n + 1), None
 
 
+class _BoolTensor:
+    """Mask of `a != b`, with the four operations sam3_fast._equal uses to explain a mismatch."""
+
+    def __init__(self, array):
+        self.array = np.asarray(array, dtype=bool)
+
+    def any(self):
+        return bool(self.array.any())
+
+    def nonzero(self):
+        return _Idx([[int(i) for i in row] for row in np.argwhere(self.array)])
+
+    def sum(self):
+        return int(self.array.sum())
+
+    def numel(self):
+        return int(self.array.size)
+
+
 class _FakeTensor:
     """Just enough tensor for sam3_fast: detach/float/cpu/to, numpy interop, shape and device."""
 
@@ -67,6 +86,15 @@ class _FakeTensor:
 
     def detach(self):
         return self
+
+    def clone(self):
+        return _FakeTensor(self.array.copy(), self.device, self.dtype)
+
+    def numel(self):
+        return int(self.array.size)
+
+    def __ne__(self, other):
+        return _BoolTensor(self.array != getattr(other, "array", other))
 
     def float(self):
         return _FakeTensor(self.array.astype("float32"), self.device, "float32")
@@ -108,15 +136,25 @@ class _FakeTensor:
         return float(self.array.max())          # what upstream's `if ... >= thresh` reads
 
 
-def install_fakes():
+_FAKE_TORCH = None
+
+
+def install_fakes(free_bytes=None):
+    """One fake torch, built once: sam3_fast binds it at import, so later calls must extend it."""
+    global _FAKE_TORCH
     import types
-    torch = types.ModuleType("torch")
-    torch.Tensor = _FakeTensor
-
-    def from_numpy(arr):
-        return _FakeTensor(np.asarray(arr), "cpu", "float32")
-
-    torch.from_numpy = from_numpy
+    if _FAKE_TORCH is None:
+        torch = types.ModuleType("torch")
+        torch.Tensor = _FakeTensor
+        torch.from_numpy = lambda arr: _FakeTensor(np.asarray(arr), "cpu", "float32")
+        torch.is_tensor = lambda x: isinstance(x, _FakeTensor)
+        torch.equal = lambda a, b: (isinstance(a, _FakeTensor) and isinstance(b, _FakeTensor)
+                                    and np.array_equal(a.array, b.array))
+        torch.cuda = types.SimpleNamespace(mem_get_info=lambda device=None: (free_bytes or 0, 15 * 2**30))
+        _FAKE_TORCH = torch
+    torch = _FAKE_TORCH
+    if free_bytes is not None:
+        torch.cuda = types.SimpleNamespace(mem_get_info=lambda device=None: (free_bytes, 15 * 2**30))
     sys.modules["torch"] = torch
     sys.modules["numpy"] = np
     return torch
@@ -172,6 +210,129 @@ def compute_overlap(a, b):
     iou = inter / np.clip(area_a + area_b - inter, 1, None)
     iom = inter / np.clip(np.minimum(np.broadcast_to(area_a, iou.shape), np.broadcast_to(area_b, iou.shape)), 1, None)
     return _FakeTensor(np.maximum(iou, iom), "cuda:0", "float32")   # a device tensor, like upstream
+
+
+# --------------------------------------------------------------------------- fidelity regressions
+
+class _NoPromoteTensor(_FakeTensor):
+    """An overlap matrix that refuses `.float()`: the fast path must compare native-dtype values."""
+
+    def float(self):
+        raise AssertionError("_nms_one_trip promoted the overlap matrix; upstream compares native dtype")
+
+
+class _Idx:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __getitem__(self, i):
+        return _Idx(self._rows[i])      # torch: indexing a 2-D tensor yields a 1-D tensor
+
+    def tolist(self):
+        return self._rows
+
+
+def saturating_overlap(a, b):
+    """fp16 overlap semantics on masks big enough to saturate fp16 (70000+ foreground pixels)."""
+    a_flat = (np.asarray(a) > 0).astype("float16").reshape(len(a), -1)
+    b_flat = (np.asarray(b) > 0).astype("float16").reshape(len(b), -1)
+    inter = np.asarray(a_flat @ b_flat.T, dtype="float16")       # stored fp16, like the real matmul
+    area_a = a_flat.sum(1, keepdims=True).astype("float16")
+    area_b = b_flat.sum(1, keepdims=True).T.astype("float16")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        iou = inter / (area_a + area_b - inter)
+        iom = inter / np.minimum(np.broadcast_to(area_a, iou.shape), np.broadcast_to(area_b, iou.shape))
+    return _NoPromoteTensor(np.maximum(iou, iom), "cuda:0", "float16")
+
+
+class _Dev:
+    def __init__(self, kind):
+        self.type = kind
+
+    def __str__(self):
+        return "cuda:0" if self.type == "cuda" else "cpu"
+
+
+def fidelity_test():
+    """The properties the flicker report makes load-bearing, asserted directly."""
+    import importlib
+    import os
+    import types
+    install_fakes()
+    import sam3_fast as sf
+    sf = importlib.reload(sf)        # reads the environment again; earlier tests force ENABLED on
+
+    checks = []
+    if "MMH3_SAM_FAST" not in os.environ:
+        checks.append(("disabled by default", sf.ENABLED is False))
+
+    # NMS: no dtype promotion, and identical decisions to upstream where fp16 saturates to inf/nan
+    tracker = type("Tracker", (), {"_compute_mask_overlap": staticmethod(saturating_overlap)})()
+    rng = np.random.default_rng(3)
+    bad, nans, differed_from_exact = 0, 0, 0
+    for trial in range(12):
+        n = int(rng.integers(2, 7))
+        masks = np.ones((n, 1, 280, 280), dtype="float16")     # 78400 px: every area past the fp16
+        for i in range(n):                                    # integer limit, overlaps still differ
+            for _ in range(2 + i):
+                y, x = int(rng.integers(0, 260)), int(rng.integers(0, 260))
+                masks[i, 0, y:y + 10, x:x + 10] = 0
+        scores = rng.random(n)
+        want_m, want_s = upstream_nms(saturating_overlap, masks, scores)
+        got_m, got_s = sf._nms_one_trip(tracker, _FakeTensor(masks), _FakeTensor(scores), 0.5)
+        got_m = np.asarray(getattr(got_m, "array", got_m))
+        got_s = np.asarray(getattr(got_s, "array", got_s))
+        if not (np.array_equal(np.asarray(want_m), got_m) and np.array_equal(np.asarray(want_s), got_s)):
+            bad += 1
+            print("  MISMATCH trial %d: kept %d vs %d" % (trial, len(np.asarray(want_s)), len(got_s)))
+        with np.errstate(invalid="ignore"):
+            nans += int(np.isnan(saturating_overlap(masks[:2], masks[:2]).array).sum())
+        # the regime is decision-relevant: real-number math on the same masks suppresses duplicates
+        exact_m, _ = upstream_nms(compute_overlap, masks.astype("float32"), scores)
+        differed_from_exact += int(len(np.asarray(exact_m)) != len(np.asarray(want_m)))
+    checks.append(("nms never promotes the overlap dtype", True))     # _NoPromoteTensor would have raised
+    checks.append(("nms decisions match upstream on saturating fp16 overlaps (%d nan entries seen)"
+                   % nans, bad == 0))
+    checks.append(("the saturation case was actually exercised", nans > 0))
+    checks.append(("saturated and exact math really do decide differently (%d/%d trials)"
+                   % (differed_from_exact, 12), differed_from_exact > 0))
+
+    # golden comparator: exact equality, and upstream's result wins a mismatch
+    checks.append(("_equal: identical", sf._equal(_FakeTensor(np.array([1.0, 2.0])), _FakeTensor(np.array([1.0, 2.0])))[0]))
+    ok, detail = sf._equal(_FakeTensor(np.array([1.0, 2.0])), _FakeTensor(np.array([1.0, 3.0])))
+    checks.append(("_equal: value mismatch detected (%s)" % detail, not ok and "differ" in detail))
+    checks.append(("_equal: shape mismatch",
+                   not sf._equal(_FakeTensor(np.ones((2, 2))), _FakeTensor(np.ones((2, 3))))[0]))
+    checks.append(("_equal: dtype mismatch",
+                   not sf._equal(_FakeTensor(np.ones(2)), _FakeTensor(np.ones(2), dtype="float32"))[0]))
+    sf._GOLDEN.update(calls=0, mismatches=0, compared=0, first="")
+    same = lambda *a, **k: _FakeTensor(np.array([1.0]))
+    checks.append(("_golden_check: silent when equal",
+                   sf._golden_check("f", same, (_FakeTensor(np.array([1.0])),), {}, _FakeTensor(np.array([1.0]))) is None
+                   and sf._GOLDEN["compared"] == 1))
+    other = lambda *a, **k: _FakeTensor(np.array([2.0]))
+    returned = sf._golden_check("f", other, (_FakeTensor(np.array([1.0])),), {}, _FakeTensor(np.array([1.0])))
+    checks.append(("_golden_check: returns upstream's result on mismatch",
+                   returned is not None and float(returned.array[0]) == 2.0 and sf._GOLDEN["mismatches"] == 1))
+
+    # device picker: floor honoured, decision sticky
+    mm = types.ModuleType("comfy.model_management")
+    mm.get_torch_device = lambda: _Dev("cuda")
+    sys.modules["comfy.model_management"] = mm
+    sys.modules["comfy"].model_management = mm   # `import comfy.model_management as mm` prefers this
+    real = lambda: _Dev("cpu")
+    install_fakes(free_bytes=3 * 2 ** 30)
+    picker = sf._pick_device(real)
+    checks.append(("picker: compute device when the card has room", picker().type == "cuda"))
+    install_fakes(free_bytes=100 * 2 ** 20)
+    picker2 = sf._pick_device(real)
+    checks.append(("picker: intermediate device when the card is full", picker2().type == "cpu"))
+    install_fakes(free_bytes=10 * 2 ** 30)
+    checks.append(("picker: decision is sticky within a run", picker2().type == "cpu"))
+
+    for name, passed in checks:
+        print("  [%s] %s" % ("ok" if passed else "FAIL", name))
+    return 0 if all(p for _, p in checks) else 1
 
 
 def main():
@@ -263,6 +424,7 @@ def install_test():
             mod.model_management = mm
         sys.modules[name] = mod
 
+    sf.ENABLED = True            # the module is off by default; this test exercises it directly
     ok = sf.patch_sam3_fast()
     checks = [("patch_sam3_fast returned True", ok is True),
               ("fill_holes patched", getattr(tracker.fill_holes_in_mask_scores, "_mmh3_fast", False)),
@@ -296,4 +458,4 @@ def install_test():
 
 
 if __name__ == "__main__":
-    sys.exit(main() or install_test())
+    sys.exit(main() or install_test() or fidelity_test())
