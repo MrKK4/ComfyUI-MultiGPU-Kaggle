@@ -14,9 +14,11 @@ faster: 34 s vs 41 s for one 896x512 decode on a T4); chunks are used only when 
 Dual GPU (LTX_VAE_DUAL=1): at 1 MP the last decoder stage only fits 7-frame chunks on the VAE's GPU,
 so each chunk recomputes 10 halo frames (2.4x the work; 144 of 163 s on a T4). The frames are split
 between the VAE's GPU and the other GPU, in proportion to how much useful work each GPU's chunk size
-gives. The other GPU reads its frames (plus halo) from a pinned-host snapshot taken before any frame
-is written and keeps its results on its own memory until the VAE's GPU has finished reading, so the
-output is the same as the single-GPU path. Before a decode, LTX_VAE_DUAL_GB of the other GPU is freed.
+gives. The other GPU first copies its frames (plus halo) into its own memory, before any frame is
+written; its results replace that copy in place once no later chunk of its own reads them, and are
+copied back after the VAE's GPU has read its halo, so the output is the same as the single-GPU path.
+Copies between the GPUs go through two fixed 512 MB pinned buffers. Before a decode larger than
+LTX_VAE_DUAL_MIN_VOXELS latent voxels, every model is unloaded from both GPUs.
 """
 import logging
 import os
@@ -35,11 +37,11 @@ logger = logging.getLogger("MultiGPU")
 FORCE_CHUNK_FRAMES = None  # tests: fixed chunk length instead of the free-VRAM fit
 FORCE_DUAL = False         # tests: split frames over both GPUs even when the clip fits
 DUAL = os.environ.get("LTX_VAE_DUAL", "0") == "1"
-DUAL_GB = float(os.environ.get("LTX_VAE_DUAL_GB", "10"))
 _RESERVE = 512 * 1024 * 1024
 _HELPER_MARGIN = 1536 * 1024 * 1024   # the other GPU: na3d workspace, allocator slack
 _PRIMARY_MARGIN = 768 * 1024 * 1024   # the VAE's GPU: snapshot/copy-back staging beside its own chunks
-_STAGE_FRAMES = 8  # frames per pinned staging copy
+_STAGE_BYTES = 512 * 1024 * 1024  # two fixed pinned staging buffers between the GPUs (never resized)
+MIN_VOXELS = int(os.environ.get("LTX_VAE_DUAL_MIN_VOXELS", "9000"))  # latent t*h*w above which models are unloaded first
 _LOGGED = set()
 _PINNED = {}
 _HELPER_WEIGHTS = {}
@@ -71,16 +73,13 @@ def _helper_device(device):
     return torch.device("cuda", (device.index + 1) % torch.cuda.device_count())
 
 
-def _pinned(name, shape, dtype):
-    n = 1
+def _stage(k, shape, dtype):
+    if k not in _PINNED:
+        _PINNED[k] = torch.empty(_STAGE_BYTES, dtype=torch.uint8, pin_memory=True)
+    n = dtype.itemsize
     for d in shape:
         n *= d
-    buf = _PINNED.get(name)
-    if buf is None or buf.numel() < n or buf.dtype != dtype:
-        _PINNED.pop(name, None)
-        buf = torch.empty(n, dtype=dtype, pin_memory=True)
-        _PINNED[name] = buf
-    return buf[:n].view(shape)
+    return _PINNED[k][:n].view(dtype).view(shape)
 
 
 def _chunks(lo, hi, tc, t, halo, kt):
@@ -153,12 +152,12 @@ def _dual(self, x, pre, res, add, helper, tc_p):
         free_p = comfy.model_management.get_free_memory(x.device) - _RESERVE - _PRIMARY_MARGIN
         tc_p = max(_fit(free_p, frame, halo, 9), halo, 1)
         tc_h, s = _fit(free_h, frame, halo, 9), t
-        for _ in range(3):  # the helper also holds its output frames, which shrinks its chunks
+        for _ in range(3):  # the helper also holds a snapshot of its frames (+ halo), which shrinks its chunks
             if tc_h < max(halo, 1):
                 return False
             r_p, r_h = tc_p / (tc_p + 2 * halo), tc_h / (tc_h + 2 * halo)
             s = int(round(t * r_p / (r_p + r_h)))
-            tc_h = _fit(free_h - (t - s) * frame, frame, halo, 9)
+            tc_h = _fit(free_h - (t - s + kt) * frame, frame, halo, 9)
     if tc_h < max(halo, 1) or not 0 < s < t:
         return False
     tc_h = max(tc_h, halo, 1)
@@ -170,35 +169,50 @@ def _dual(self, x, pre, res, add, helper, tc_p):
         logger.info("[MultiGPU] LTX VAE attention %s: %d frames on %s (%d-frame chunks), %d on %s (%d-frame chunks)",
                     tuple(x.shape[:4]), s, x.device, tc_p, t - s, helper, tc_h)
 
-    # snapshot of every frame the helper reads, taken before any frame of x is written
+    # snapshot of every frame the helper reads, taken before any frame of x is written; it lives on the helper
+    # and later holds the helper's results (written in place once no later helper chunk reads those frames)
     ha = min(c[2] for c in h_chunks)
-    host_in = _pinned("in", (batch, t - ha, h, w, self.dim), x.dtype)
-    for f0 in range(ha, t, _STAGE_FRAMES):
-        f1 = min(f0 + _STAGE_FRAMES, t)
+    n = max(1, _STAGE_BYTES // frame)
+    ps = torch.cuda.current_stream(x.device)
+    hs = torch.cuda.Stream(helper)
+    with torch.cuda.device(helper), torch.cuda.stream(hs):
+        snap = torch.empty((batch, t - ha, h, w, self.dim), dtype=x.dtype, device=helper)
+    freed = [None, None]
+    for i, f0 in enumerate(range(ha, t, n)):
+        f1, k = min(f0 + n, t), i % 2
+        buf = _stage(k, (batch, f1 - f0, h, w, self.dim), x.dtype)
+        if freed[k] is not None:
+            ps.wait_event(freed[k])
         piece = x[:, f0:f1] if pre is None else pre(x[:, f0:f1])
-        host_in[:, f0 - ha:f1 - ha].copy_(piece, non_blocking=True)
+        buf.copy_(piece, non_blocking=True)
         del piece
-    snapshot = torch.cuda.Event()
-    snapshot.record(torch.cuda.current_stream(x.device))
+        ready = torch.cuda.Event()
+        ready.record(ps)
+        hs.wait_event(ready)
+        with torch.cuda.device(helper), torch.cuda.stream(hs):
+            snap[:, f0 - ha:f1 - ha].copy_(buf, non_blocking=True)
+        freed[k] = torch.cuda.Event()
+        freed[k].record(hs)
 
     state = {}
     weights = _helper_weights(self, helper, x.dtype)
 
     def work():
         try:
-            with torch.inference_mode(), torch.cuda.device(helper), torch.cuda.stream(torch.cuda.Stream(helper)):
+            with torch.inference_mode(), torch.cuda.device(helper), torch.cuda.stream(hs):
                 qkv_w, qkv_b, proj_w, proj_b, q_weight, k_weight = weights
                 inv = tuple(nd.rope_inv_freqs(d, self.rope_base, device=helper) for d in self.rope_split)
                 tables = nd._rope_tables((t, h, w), inv, helper)
-                out = torch.empty((batch, t - s, h, w, self.dim), dtype=x.dtype, device=helper)
-                snapshot.synchronize()
-                for t0, t1, a, b in h_chunks:
-                    sl = host_in[:, a - ha:b - ha].to(helper, non_blocking=True)
-                    out[:, t0 - s:t1 - s] = _attend(self, sl, a, b, t0, t1, tables, q_weight, k_weight,
-                                                    lambda z: F.linear(z, qkv_w, qkv_b), lambda z: F.linear(z, proj_w, proj_b))
-                    del sl
-                torch.cuda.current_stream(helper).synchronize()
-                state["out"] = out
+                pending = []
+                for j, (t0, t1, a, b) in enumerate(h_chunks):
+                    pending.append((t0, t1, _attend(self, snap[:, a - ha:b - ha], a, b, t0, t1, tables, q_weight, k_weight,
+                                                    lambda z: F.linear(z, qkv_w, qkv_b), lambda z: F.linear(z, proj_w, proj_b))))
+                    next_read = min((c[2] for c in h_chunks[j + 1:]), default=t)
+                    while pending and pending[0][1] <= next_read:
+                        p0, p1, py = pending.pop(0)
+                        snap[:, p0 - ha:p1 - ha] = py
+                del pending, tables
+                hs.synchronize()
         except BaseException as e:  # re-raised on the caller's thread
             if isinstance(e, torch.OutOfMemoryError):
                 _log_oom(helper, "%d frames in %d-frame chunks" % (t - s, tc_h))
@@ -217,22 +231,33 @@ def _dual(self, x, pre, res, add, helper, tc_p):
     finally:
         thread.join()
     if "error" in state:
+        hs.synchronize()
+        del snap
         raise state["error"]
 
     # the helper's frames are written only now: the last primary chunk read their halo
-    out = state.pop("out")
-    stage = _pinned("out", (batch, _STAGE_FRAMES, h, w, self.dim), x.dtype)
-    for f0 in range(0, t - s, _STAGE_FRAMES):
-        f1 = min(f0 + _STAGE_FRAMES, t - s)
-        part = stage[:, :f1 - f0]
-        part.copy_(out[:, f0:f1])  # synchronous: the staging buffer is reused next iteration
-        py = part.to(x.device)
+    used = [None, None]
+    for i, f0 in enumerate(range(s, t, n)):
+        f1, k = min(f0 + n, t), i % 2
+        buf = _stage(k, (batch, f1 - f0, h, w, self.dim), x.dtype)
+        if used[k] is not None:
+            hs.wait_event(used[k])
+        with torch.cuda.device(helper), torch.cuda.stream(hs):
+            buf.copy_(snap[:, f0 - ha:f1 - ha], non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record(hs)
+        ps.wait_event(ready)
+        py = buf.to(x.device, non_blocking=True)
         if add:
-            res[:, s + f0:s + f1] += py
+            res[:, f0:f1] += py
         else:
-            res[:, s + f0:s + f1] = py
+            res[:, f0:f1] = py
         del py
-    del out
+        used[k] = torch.cuda.Event()
+        used[k].record(ps)
+    ps.synchronize()
+    hs.synchronize()
+    del snap
     return True
 
 
@@ -258,18 +283,32 @@ def forward(self, x, pre=None, add_to=None):
     return res
 
 
+def _gpu_gb():
+    return "/".join("%.1f" % (torch.cuda.memory_allocated(d) / 2**30) for d in range(torch.cuda.device_count()))
+
+
 def _dual_decode(orig):
-    def run(self, *args, **kwargs):
+    def run(self, samples, *args, **kwargs):
         helper = None
         if DUAL and isinstance(getattr(self, "first_stage_model", None), nd.CausalDiffusionVAE):
             helper = _helper_device(torch.device(self.device))
         if helper is None:
-            return orig(self, *args, **kwargs)
-        comfy.model_management.free_memory(DUAL_GB * 1024 ** 3, helper)
+            return orig(self, samples, *args, **kwargs)
+        voxels = samples.shape[-3] * samples.shape[-2] * samples.shape[-1]
+        if voxels > MIN_VOXELS:
+            # a large decode needs most of both GPUs: unload every model (the next job reloads them)
+            before = _gpu_gb()
+            for d in range(torch.cuda.device_count()):
+                comfy.model_management.free_memory(1e30, torch.device("cuda", d))
+            comfy.model_management.soft_empty_cache()
+            for d in range(torch.cuda.device_count()):
+                with torch.cuda.device(d):
+                    torch.cuda.empty_cache()
+            logger.info("[MultiGPU] LTX VAE dual decode: unloaded models before a %d-voxel decode, torch allocated GB %s -> %s",
+                        voxels, before, _gpu_gb())
         try:
-            return orig(self, *args, **kwargs)
+            return orig(self, samples, *args, **kwargs)
         finally:
-            _PINNED.clear()
             _HELPER_WEIGHTS.clear()
             with torch.cuda.device(helper):
                 torch.cuda.empty_cache()
