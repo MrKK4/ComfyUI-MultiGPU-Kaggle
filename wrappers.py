@@ -545,6 +545,8 @@ def override_class_clip(cls):
             kwargs['device'] = 'default'
             fn = getattr(super(), cls.FUNCTION)
             out = fn(*args, **kwargs)
+            from .ltx_te_host_cache import prefer_clip_host_cache
+            prefer_clip_host_cache(out[0])
             try:
                 return out
             finally:
