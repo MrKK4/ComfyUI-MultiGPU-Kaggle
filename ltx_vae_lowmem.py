@@ -37,6 +37,8 @@ FORCE_DUAL = False         # tests: split frames over both GPUs even when the cl
 DUAL = os.environ.get("LTX_VAE_DUAL", "0") == "1"
 DUAL_GB = float(os.environ.get("LTX_VAE_DUAL_GB", "10"))
 _RESERVE = 512 * 1024 * 1024
+_HELPER_MARGIN = 1536 * 1024 * 1024   # the other GPU: na3d workspace, allocator slack
+_PRIMARY_MARGIN = 768 * 1024 * 1024   # the VAE's GPU: snapshot/copy-back staging beside its own chunks
 _STAGE_FRAMES = 8  # frames per pinned staging copy
 _LOGGED = set()
 _PINNED = {}
@@ -44,9 +46,10 @@ _HELPER_WEIGHTS = {}
 _orig_forward = nd.NeighborhoodAttention3D.forward
 
 
-def _fit(free, frame, halo):
-    # per chunk of tc frames: pre(x) + qkv output (3) + q, k, v + na3d out over tc + 2*halo, plus the pending projection (tc)
-    return int((free / frame - 7 * 2 * halo) // 8)
+def _fit(free, frame, halo, units=8):
+    # per chunk of tc frames: pre(x) + qkv output (3) + q, k, v + na3d out over tc + 2*halo, plus the pending projection (tc);
+    # units=9 also counts the fp32 RoPE matrices (512 B per token at head_dim 64 = one fp16 frame at dim 256)
+    return int((free / frame - (units - 1) * 2 * halo) // units)
 
 
 def _chunk_frames(self, x):
@@ -124,6 +127,12 @@ def _run_chunks(self, x, pre, res, add, chunks, tables, q_weight, k_weight):
                 res[:, p0:p1] = py
 
 
+def _log_oom(dev, what):
+    logger.warning("[MultiGPU] LTX VAE dual decode out of memory on %s (%s): allocated %.2f GB, reserved %.2f GB, free %.2f GB",
+                   dev, what, torch.cuda.memory_allocated(dev) / 2**30, torch.cuda.memory_reserved(dev) / 2**30,
+                   torch.cuda.mem_get_info(dev)[0] / 2**30)
+
+
 def _helper_weights(self, dev, dtype):
     key = (id(self), dev, self.qkv.weight.data_ptr())
     if key not in _HELPER_WEIGHTS:
@@ -137,17 +146,19 @@ def _dual(self, x, pre, res, add, helper, tc_p):
     batch, t, h, w, _ = x.shape
     halo, kt = self.kernel_size[0] // 2, self.kernel_size[0]
     frame = batch * h * w * self.dim * x.element_size()
-    free_h = comfy.model_management.get_free_memory(helper) - _RESERVE
+    free_h = comfy.model_management.get_free_memory(helper) - _RESERVE - _HELPER_MARGIN
     if FORCE_CHUNK_FRAMES is not None or FORCE_DUAL:
         tc_h, s = tc_p, t // 2
     else:
-        tc_h, s = _fit(free_h, frame, halo), t
+        free_p = comfy.model_management.get_free_memory(x.device) - _RESERVE - _PRIMARY_MARGIN
+        tc_p = max(_fit(free_p, frame, halo, 9), halo, 1)
+        tc_h, s = _fit(free_h, frame, halo, 9), t
         for _ in range(3):  # the helper also holds its output frames, which shrinks its chunks
             if tc_h < max(halo, 1):
                 return False
             r_p, r_h = tc_p / (tc_p + 2 * halo), tc_h / (tc_h + 2 * halo)
             s = int(round(t * r_p / (r_p + r_h)))
-            tc_h = _fit(free_h - (t - s) * frame, frame, halo)
+            tc_h = _fit(free_h - (t - s) * frame, frame, halo, 9)
     if tc_h < max(halo, 1) or not 0 < s < t:
         return False
     tc_h = max(tc_h, halo, 1)
@@ -189,6 +200,8 @@ def _dual(self, x, pre, res, add, helper, tc_p):
                 torch.cuda.current_stream(helper).synchronize()
                 state["out"] = out
         except BaseException as e:  # re-raised on the caller's thread
+            if isinstance(e, torch.OutOfMemoryError):
+                _log_oom(helper, "%d frames in %d-frame chunks" % (t - s, tc_h))
             state["error"] = e
 
     thread = threading.Thread(target=work, name="ltx-vae-helper")
@@ -198,6 +211,9 @@ def _dual(self, x, pre, res, add, helper, tc_p):
         tables = nd._rope_tables((t, h, w), inv, x.device)
         q_weight, k_weight = _norm_weights(self, x.dtype)
         _run_chunks(self, x, pre, res, add, p_chunks, tables, q_weight, k_weight)
+    except torch.OutOfMemoryError:
+        _log_oom(x.device, "%d frames in %d-frame chunks" % (s, tc_p))
+        raise
     finally:
         thread.join()
     if "error" in state:
