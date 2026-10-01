@@ -2,10 +2,11 @@
 
 NeighborhoodAttention3D materializes full-clip q, k, v and the attention output (4x the stage
 activation; ~7 GB of the 12.8 GB peak at 896x512x121). Neighbourhood attention is local in time, so it
-is run here over frame chunks with a k_t//2 halo on each side: a query keeps the same window as in the
-full clip (NATTEN shifts windows inward only at the real grid ends, and chunks touching an end keep
-it), so the output is the same. The residual stream is updated in place, so each chunk's result is
-written only after the next chunk has read its halo. The chunk length is sized to the free VRAM.
+is run here over frame chunks with a k_t//2 halo on each side. Only the chunk's own frames are queried
+(comfy_kitchen's eager na3d restricted to those rows, with the whole clip's window geometry); the halo
+frames are only read as keys and values, so a chunk costs the attention of its own frames, not
+2*halo more. The residual stream is updated in place, so each chunk's result is written only after
+the next chunk has read its halo. The chunk length is sized to the free VRAM.
 
 The original full-clip forward still runs whenever its q, k, v and output fit in free VRAM (it is
 faster: 34 s vs 41 s for one 896x512 decode on a T4); chunks are used only when they do not, e.g. at
@@ -31,6 +32,7 @@ import comfy.ldm.lightricks.vae.na_diffusion_decoder as nd
 import comfy.model_management
 import comfy.sd
 import comfy_kitchen
+import comfy_kitchen.backends.eager.na as ckna
 
 logger = logging.getLogger("MultiGPU")
 
@@ -48,10 +50,11 @@ _HELPER_WEIGHTS = {}
 _orig_forward = nd.NeighborhoodAttention3D.forward
 
 
-def _fit(free, frame, halo, units=8):
-    # per chunk of tc frames: pre(x) + qkv output (3) + q, k, v + na3d out over tc + 2*halo, plus the pending projection (tc);
-    # units=9 also counts the fp32 RoPE matrices (512 B per token at head_dim 64 = one fp16 frame at dim 256)
-    return int((free / frame - (units - 1) * 2 * halo) // units)
+def _fit(free, frame, halo):
+    # per chunk of tc frames, over tc + 2*halo frames: pre(x), qkv output (3) and the fp32 RoPE matrices
+    # (512 B per token at head_dim 64 = one fp16 frame at dim 256); over tc frames: the na3d output and the
+    # pending projection
+    return int((free / frame - 5 * 2 * halo) // 7)
 
 
 def _chunk_frames(self, x):
@@ -92,7 +95,63 @@ def _chunks(lo, hi, tc, t, halo, kt):
     return out
 
 
-def _attend(self, sl, a, b, t0, t1, tables, q_weight, k_weight, qkv, proj):
+def _na3d_rows(q, k, v, kernel_size, t_total, q0, k0):
+    """comfy_kitchen's eager na3d restricted to query frames [q0, q0 + tq) of a t_total-frame clip.
+
+    Keys/values cover frames [k0, k0 + tk), which must contain every queried window. Windows are those of
+    the whole clip (shifted inward only at its real ends), so each output equals the full-clip na3d output
+    for that frame; halo frames are only read as keys, never computed as queries. Same tiling, geometry
+    grouping, masks and SDPA calls as ckna.na3d (non-causal, dilation 1, pre-scaled queries).
+    """
+    batch, tq, h, w, nh, hd = q.shape
+    kernels = [min(kernel_size[0], t_total), min(kernel_size[1], h), min(kernel_size[2], w)]
+    st, en = ckna._window_bounds(t_total, kernels[0], False)
+    bt = ([x - k0 for x in st[q0:q0 + tq]], [x - k0 for x in en[q0:q0 + tq]])
+    bh = ckna._window_bounds(h, kernels[1], False)
+    bw = ckna._window_bounds(w, kernels[2], False)
+    tile_t, tile_h, tile_w = ckna._pick_tiles((tq, h, w), kernels)
+    groups = {}
+    for t0 in range(0, tq, tile_t):
+        t1 = min(t0 + tile_t, tq)
+        rt0, rt1 = bt[0][t0], bt[1][t1 - 1]
+        rel_t = (tuple(x - rt0 for x in bt[0][t0:t1]), tuple(x - rt0 for x in bt[1][t0:t1]))
+        for h0 in range(0, h, tile_h):
+            h1 = min(h0 + tile_h, h)
+            rh0, rh1 = bh[0][h0], bh[1][h1 - 1]
+            rel_h = (tuple(x - rh0 for x in bh[0][h0:h1]), tuple(x - rh0 for x in bh[1][h0:h1]))
+            for w0 in range(0, w, tile_w):
+                w1 = min(w0 + tile_w, w)
+                rw0, rw1 = bw[0][w0], bw[1][w1 - 1]
+                rel_w = (tuple(x - rw0 for x in bw[0][w0:w1]), tuple(x - rw0 for x in bw[1][w0:w1]))
+                groups.setdefault((rel_t, rel_h, rel_w), []).append((
+                    (slice(t0, t1), slice(h0, h1), slice(w0, w1)),
+                    (slice(rt0, rt1), slice(rh0, rh1), slice(rw0, rw1)),
+                ))
+    out = torch.empty((batch, tq, h, w, nh, hd), device=q.device, dtype=v.dtype)
+    for rel, tiles in groups.items():
+        mask = ckna._group_mask(rel, q.dtype, q.device)
+        nq, nk = mask.shape[2], mask.shape[3]
+        g_max = max(1, ckna.NA_KV_STACK_BUDGET // max(1, batch * nh * nk * hd * 2))
+        qs0, _ = tiles[0]
+        tt, th, tw = (qs0[0].stop - qs0[0].start, qs0[1].stop - qs0[1].start, qs0[2].stop - qs0[2].start)
+        for c0 in range(0, len(tiles), g_max):
+            chunk = tiles[c0:c0 + g_max]
+            g = len(chunk)
+            q_s = torch.stack([q[:, qs[0], qs[1], qs[2]] for qs, _ in chunk])
+            k_s = torch.stack([k[:, rs[0], rs[1], rs[2]] for _, rs in chunk])
+            v_s = torch.stack([v[:, rs[0], rs[1], rs[2]] for _, rs in chunk])
+            q_s = q_s.permute(0, 1, 5, 2, 3, 4, 6).reshape(g * batch, nh, nq, hd)
+            k_s = k_s.permute(0, 1, 5, 2, 3, 4, 6).reshape(g * batch, nh, nk, hd)
+            v_s = v_s.permute(0, 1, 5, 2, 3, 4, 6).reshape(g * batch, nh, nk, hd)
+            o = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=mask, scale=1.0)
+            o = o.view(g, batch, nh, tt, th, tw, hd).permute(0, 1, 3, 4, 5, 2, 6)
+            for i, (qs, _) in enumerate(chunk):
+                out[:, qs[0], qs[1], qs[2]] = o[i]
+            del q_s, k_s, v_s, o
+    return out
+
+
+def _attend(self, sl, a, b, t0, t1, t_total, tables, q_weight, k_weight, qkv, proj):
     batch, _, h, w, _ = sl.shape
     cshape = (batch, b - a, h, w, self.num_heads, self.head_dim)
     q, k, v = (c.reshape(cshape) for c in qkv(sl).chunk(3, dim=-1))
@@ -101,9 +160,10 @@ def _attend(self, sl, a, b, t0, t1, tables, q_weight, k_weight, qkv, proj):
     for bi in range(batch):
         comfy_kitchen.rms_rope_(q[bi].view(1, nt, self.num_heads, self.head_dim),
                                 k[bi].view(1, nt, self.num_heads, self.head_dim), freqs, q_weight, k_weight)
-    out = comfy_kitchen.na3d(q, k, v, list(self.kernel_size), None, 1.0)
+    del freqs
+    out = _na3d_rows(q[:, t0 - a:t1 - a], k, v, list(self.kernel_size), t_total, t0, a)
     del q, k, v
-    return proj(out[:, t0 - a:t1 - a].reshape(batch, t1 - t0, h, w, self.dim))
+    return proj(out.reshape(batch, t1 - t0, h, w, self.dim))
 
 
 def _norm_weights(self, dtype):
@@ -114,7 +174,7 @@ def _run_chunks(self, x, pre, res, add, chunks, tables, q_weight, k_weight):
     pending = []
     for j, (t0, t1, a, b) in enumerate(chunks):
         sl = x[:, a:b] if pre is None else pre(x[:, a:b])
-        pending.append((t0, t1, _attend(self, sl, a, b, t0, t1, tables, q_weight, k_weight, self.qkv, self.proj)))
+        pending.append((t0, t1, _attend(self, sl, a, b, t0, t1, x.shape[1], tables, q_weight, k_weight, self.qkv, self.proj)))
         del sl
         # in place: a result is written only once no later chunk reads those frames
         next_read = min((c[2] for c in chunks[j + 1:]), default=x.shape[1])
@@ -150,14 +210,14 @@ def _dual(self, x, pre, res, add, helper, tc_p):
         tc_h, s = tc_p, t // 2
     else:
         free_p = comfy.model_management.get_free_memory(x.device) - _RESERVE - _PRIMARY_MARGIN
-        tc_p = max(_fit(free_p, frame, halo, 9), halo, 1)
-        tc_h, s = _fit(free_h, frame, halo, 9), t
+        tc_p = max(_fit(free_p, frame, halo), halo, 1)
+        tc_h, s = _fit(free_h, frame, halo), t
         for _ in range(3):  # the helper also holds a snapshot of its frames (+ halo), which shrinks its chunks
             if tc_h < max(halo, 1):
                 return False
             r_p, r_h = tc_p / (tc_p + 2 * halo), tc_h / (tc_h + 2 * halo)
             s = int(round(t * r_p / (r_p + r_h)))
-            tc_h = _fit(free_h - (t - s + kt) * frame, frame, halo, 9)
+            tc_h = _fit(free_h - (t - s + kt) * frame, frame, halo)
     if tc_h < max(halo, 1) or not 0 < s < t:
         return False
     tc_h = max(tc_h, halo, 1)
@@ -205,7 +265,7 @@ def _dual(self, x, pre, res, add, helper, tc_p):
                 tables = nd._rope_tables((t, h, w), inv, helper)
                 pending = []
                 for j, (t0, t1, a, b) in enumerate(h_chunks):
-                    pending.append((t0, t1, _attend(self, snap[:, a - ha:b - ha], a, b, t0, t1, tables, q_weight, k_weight,
+                    pending.append((t0, t1, _attend(self, snap[:, a - ha:b - ha], a, b, t0, t1, t, tables, q_weight, k_weight,
                                                     lambda z: F.linear(z, qkv_w, qkv_b), lambda z: F.linear(z, proj_w, proj_b))))
                     next_read = min((c[2] for c in h_chunks[j + 1:]), default=t)
                     while pending and pending[0][1] <= next_read:
@@ -283,29 +343,30 @@ def forward(self, x, pre=None, add_to=None):
     return res
 
 
-def _gpu_gb():
-    return "/".join("%.1f" % (torch.cuda.memory_allocated(d) / 2**30) for d in range(torch.cuda.device_count()))
+def _gpu_free():
+    return " ".join("cuda:%d %.1f/%.1f GB free" % ((d,) + tuple(v / 2**30 for v in torch.cuda.mem_get_info(d)))
+                    for d in range(torch.cuda.device_count()))
 
 
 def _dual_decode(orig):
     def run(self, samples, *args, **kwargs):
-        helper = None
-        if DUAL and isinstance(getattr(self, "first_stage_model", None), nd.CausalDiffusionVAE):
-            helper = _helper_device(torch.device(self.device))
-        if helper is None:
+        if not isinstance(getattr(self, "first_stage_model", None), nd.CausalDiffusionVAE):
             return orig(self, samples, *args, **kwargs)
         voxels = samples.shape[-3] * samples.shape[-2] * samples.shape[-1]
+        helper = _helper_device(torch.device(self.device)) if DUAL else None
         if voxels > MIN_VOXELS:
-            # a large decode needs most of both GPUs: unload every model (the next job reloads them)
-            before = _gpu_gb()
+            logger.info("[MultiGPU] LTX VAE decode (%d latent voxels) on %s: %s", voxels, self.device, _gpu_free())
+        if helper is None:
+            return orig(self, samples, *args, **kwargs)
+        if voxels > MIN_VOXELS:
+            # a large dual decode needs most of both GPUs: unload every model (the next job reloads them)
             for d in range(torch.cuda.device_count()):
                 comfy.model_management.free_memory(1e30, torch.device("cuda", d))
             comfy.model_management.soft_empty_cache()
             for d in range(torch.cuda.device_count()):
                 with torch.cuda.device(d):
                     torch.cuda.empty_cache()
-            logger.info("[MultiGPU] LTX VAE dual decode: unloaded models before a %d-voxel decode, torch allocated GB %s -> %s",
-                        voxels, before, _gpu_gb())
+            logger.info("[MultiGPU] LTX VAE dual decode: unloaded models, now %s", _gpu_free())
         try:
             return orig(self, samples, *args, **kwargs)
         finally:
