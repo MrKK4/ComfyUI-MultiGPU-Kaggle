@@ -1,9 +1,54 @@
-> [!IMPORTANT]
-> **This repository will be archived on 30 September 2026. It is no longer maintained.**
->
-> There will be no further code updates or support from the maintainer.
->
-> Fork maintainers can announce themselves in the [pinned coordination issue](https://github.com/pollockjj/ComfyUI-MultiGPU/issues/223). The repository is not being transferred and no fork is endorsed.
+# ComfyUI-MultiGPU — Kaggle 2× T4 fork (MiniMax H3 + LTX 2.x)
+
+A fork of [pollockjj/ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU) (archived 30 September 2026)
+with extra nodes and patches for running **MiniMax H3** and **LTX 2.x** video models on **two Tesla T4s**
+(sm_75, 15 GB each, no NVLink/P2P, no bf16), as on Kaggle's free tier. Upstream nodes are unchanged; the
+additions below sit on top and are inert for other models and GPUs.
+
+Tested with ComfyUI v0.37.0, torch 2.10.0+cu130, comfy-kitchen 0.2.35, comfy-aimdo 0.5.5 (dynamic VRAM).
+
+## What this fork adds
+
+### Nodes
+| Node | What it does |
+|---|---|
+| `UNETLoaderH3TensorParallel` | Loads an int8 MiniMax H3 DiT as **Megatron-style tensor parallel over cuda:0 + cuda:1**: column/row-parallel shards, fp32 residual, partial sums exchanged through pinned host memory in row chunks on side streams (overlapped with compute). LoRAs added after the loader (`LoraLoaderModelOnly`) are applied as sharded low-rank side paths. |
+| `VAEEncodeH3DualGPU` / `VAEDecodeH3DualGPU` | MiniMax H3 video VAE encode/decode split over both GPUs: odd temporal clips run on an encoder-only / decoder-only helper copy on the other card. |
+| `VAEDecodeLTXDualGPU` | LTX 2.x VAE decode split along width over both GPUs, blended over an overlap. |
+
+### Patches (applied at import)
+| Module | What it does | Switch |
+|---|---|---|
+| `h3_mixed_precision.py` | fp16 compute for H3 on GPUs without bf16; keeps the three overflow points wide (Qwen3-VL text states, residual stream, fc2/out_proj via 1/S scaling). | `MMH3_H3_FP16=0` disables |
+| `ltx_mixed_precision.py` | fp16 compute for LTX on GPUs without bf16. | `LTX_FP16=0` disables |
+| `kitchen_turing_fix.py` | Routes comfy-kitchen's SM80-only CUTLASS fp16 conv3d/linear to torch below Ampere, pins kitchen launches to the tensor's device, lowers the eager na3d score budget. | — |
+| `ltx_vae_lowmem.py` | Exact LTX 2.x VAE decode with frame-chunked neighbourhood attention and a realistic decode estimate. | — |
+| `h3_ref_cache.py` | Reuses the H3 Ref2VA prompt + reference-image encode (~60 s) across jobs when prompt and face are unchanged; keyed on the encoder weights, so it survives loader re-runs. | `MMH3_REF_CACHE=0` disables |
+| `sam3_profile.py` | Before `SAM3_VideoTrack`, unloads cuda:0 models and releases the TP shards (SAM's tracking memory grows over a clip), retries once on OOM, logs memory; `sam_profile.request` in ComfyUI's working dir profiles one run into `sam_profile.txt`. | — |
+| `model_management_mgpu.py` | Host-RAM threshold above which MultiGPU drops ComfyUI's output cache between prompts. | `MULTIGPU_CPU_RESET_PERCENT` (default 85; 100 = off) |
+
+Tensor-parallel tuning: `MMH3_TP_CHUNKS` (exchange row chunks, default 4), `MMH3_TP_QKV_PREFETCH=0` (no next-block
+qkv prefetch), `MMH3_TP_SIDE_STREAMS=0` (copies on the compute streams), `MMH3_TP_CHECK=1` (run a one-time
+numerical check against the original blocks). `tp_profile.request` in ComfyUI's working dir profiles one sampling step into `tp_profile.txt`.
+
+### Measured on Kaggle 2× T4
+| Workload | Before | With this fork |
+|---|---|---|
+| H3 DiT, 0.7 MP, per step | 104.5 s (DisTorch Split) | 58.8 s (tensor parallel) |
+| H3 VAE encode + decode, 124 frames | ~208 s | ~81 s (dual GPU) |
+| H3 Ref2VA face swap, 124 frames, 6 steps, 0.5 MP crop | ~1300 s | ~540 s warm (SAM 3.1 mask ~147 s + generation ~392 s) |
+| H3 T2VA 544×960, 124 frames, 6 steps | — | 27 s/step, 212 s warm |
+
+### Notes and limits
+- Tensor parallel needs exactly two CUDA GPUs and an int8 convrot H3 checkpoint; it supports plain LoRA only
+  (no LoCon mid, DoRA, LoHa/LoKr). The shards (~10 GB per card) stay resident between jobs and are released
+  before SAM 3.1 tracking, so the next generation re-shards them.
+- On Kaggle, launch ComfyUI with `--vram-headroom 2`; otherwise dynamic VRAM caching starves the TP allocations.
+- Stable releases are tagged `kaggle-ok-N`; pin a tag rather than a branch.
+
+---
+
+# Original ComfyUI-MultiGPU documentation
 
 # ComfyUI-MultiGPU v2: Universal .safetensors and GGUF Multi-GPU Distribution with DisTorch
 <p align="center">
