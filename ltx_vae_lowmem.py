@@ -8,8 +8,9 @@ it), so the output is the same. The residual stream is updated in place, so each
 written only after the next chunk has read its halo. The chunk length is sized to the free VRAM; when
 the whole clip fits, the original forward runs unchanged.
 
-The VAE's decode estimate (1700 x 512 x latent voxels) makes ComfyUI evict ~12.5 GB before an
-896x512 decode; it is replaced by the full-clip x + context tensors plus room for small chunks.
+The original full-clip forward still runs whenever its q, k, v and output fit in free VRAM (it is
+faster: 34 s vs 41 s for one 896x512 decode on a T4); chunks are used only when they do not, e.g. at
+1 MP. ComfyUI's own decode estimate is kept, so the VAE's GPU is cleared before a decode as before.
 """
 import logging
 
@@ -24,6 +25,7 @@ logger = logging.getLogger("MultiGPU")
 
 FORCE_CHUNK_FRAMES = None  # tests: fixed chunk length instead of the free-VRAM fit
 _RESERVE = 512 * 1024 * 1024
+_LOGGED = set()
 _orig_forward = nd.NeighborhoodAttention3D.forward
 
 
@@ -34,6 +36,9 @@ def _chunk_frames(self, x):
         return max(FORCE_CHUNK_FRAMES, halo, 1)
     frame = x.shape[0] * h * w * self.dim * x.element_size()
     free = comfy.model_management.get_free_memory(x.device) - _RESERVE
+    # original forward: full-clip q, k, v, out + one qkv slice of at most 2**25 elements per tensor
+    if free >= 4 * t * frame + 4 * (2 ** 25) * x.element_size():
+        return t
     # per chunk of tc frames: pre(x) + qkv output (3) + q, k, v + na3d out over tc + 2*halo, plus the pending projection (tc)
     tc = int((free / frame - 7 * 2 * halo) // 8)
     return max(tc, halo, 1)
@@ -44,6 +49,10 @@ def forward(self, x, pre=None, add_to=None):
     tc = _chunk_frames(self, x)
     if tc >= t:
         return _orig_forward(self, x, pre, add_to)
+    key = (tuple(x.shape), tc)
+    if key not in _LOGGED:
+        _LOGGED.add(key)
+        logger.info("[MultiGPU] LTX VAE attention %s: %d-frame chunks (full clip does not fit)", tuple(x.shape[:4]), tc)
     halo = self.kernel_size[0] // 2
     inv_freqs = tuple(nd.rope_inv_freqs(d, self.rope_base, device=x.device) for d in self.rope_split)
     tables = nd._rope_tables((t, h, w), inv_freqs, x.device)
@@ -83,20 +92,9 @@ def forward(self, x, pre=None, add_to=None):
     return res
 
 
-_orig_vae_init = comfy.sd.VAE.__init__
-
-
-def _vae_init(self, *args, **kwargs):
-    _orig_vae_init(self, *args, **kwargs)
-    if isinstance(getattr(self, "first_stage_model", None), nd.CausalDiffusionVAE):
-        # full-clip stage-5 x + context: 512 tokens x 256 ch per latent voxel each, + chunk/workspace headroom
-        self.memory_used_decode = lambda shape, dtype: (2 * 512 * 256 * shape[2] * shape[3] * shape[4]) * comfy.model_management.dtype_size(dtype) + 2 * 1024 ** 3
-
-
 def patch_ltx_vae_lowmem():
     if getattr(nd.NeighborhoodAttention3D.forward, "_mgpu_lowmem", False):
         return
     forward._mgpu_lowmem = True
     nd.NeighborhoodAttention3D.forward = forward
-    comfy.sd.VAE.__init__ = _vae_init
-    logger.info("[MultiGPU] LTX diffusion VAE: frame-chunked neighbourhood attention + lower decode estimate")
+    logger.info("[MultiGPU] LTX diffusion VAE: frame-chunked neighbourhood attention when the full clip does not fit")
