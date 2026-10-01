@@ -2,6 +2,7 @@
 import gc
 import json
 import statistics
+import struct
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,41 @@ def sync():
         torch.cuda.synchronize(d)
 
 
+def ff_inventory(path):
+    # Read the small safetensors header before materializing any large tensor.
+    with open(path, 'rb') as handle:
+        size = struct.unpack('<Q', handle.read(8))[0]
+        if size > 64 << 20:
+            raise RuntimeError('Unexpected safetensors header size')
+        header = json.loads(handle.read(size))
+    keys = set(header) - {'__metadata__'}
+    firsts = sorted(k for k in keys if k.endswith('.ff.net.0.proj.weight') and 'transformer_blocks.' in k)
+    if len(firsts) != 48:
+        raise RuntimeError('Expected 48 video feedforward blocks; found ' + str(len(firsts)))
+    matrix_bytes, extra_bytes, dtypes = 0, 0, {}
+    for key in firsts:
+        prefix = key[:-len('net.0.proj.weight')]
+        for suffix in ('net.0.proj', 'net.2'):
+            name = prefix + suffix
+            info = header[name + '.weight']
+            dtype = info['dtype']
+            if dtype not in ('I8', 'F16', 'BF16', 'F32'):
+                raise RuntimeError('Unsupported FF storage dtype: ' + name + ': ' + dtype)
+            dtypes[dtype] = dtypes.get(dtype, 0) + 1
+            matrix_bytes += info['data_offsets'][1] - info['data_offsets'][0]
+            scale_key = name + '.weight_scale'
+            if dtype == 'I8' and scale_key not in keys:
+                raise RuntimeError('Missing int8 scale: ' + name)
+            if dtype == 'I8':
+                info = header[scale_key]
+                extra_bytes += 2 * (info['data_offsets'][1] - info['data_offsets'][0])
+            bias_key = name + '.bias'
+            if bias_key in keys:
+                info = header[bias_key]
+                extra_bytes += info['data_offsets'][1] - info['data_offsets'][0]
+    return firsts, matrix_bytes, matrix_bytes + extra_bytes, dtypes
+
+
 def main():
     if torch.cuda.device_count() != 2:
         raise RuntimeError('Two CUDA devices required')
@@ -25,24 +61,17 @@ def main():
         if torch.cuda.get_device_capability(d) != (7, 5):
             raise RuntimeError('This probe targets Kaggle T4 GPUs')
     start = time.perf_counter()
+    firsts, matrix_bytes, budget_bytes, storage_dtypes = ff_inventory(sys.argv[1])
     with safe_open(sys.argv[1], framework='pt', device='cpu') as f:
         keys = set(f.keys())
-        firsts = sorted(k for k in keys if k.endswith('.ff.net.0.proj.weight') and 'transformer_blocks.' in k)
-        if len(firsts) != 48:
-            raise RuntimeError('Expected 48 video feedforward blocks; found ' + str(len(firsts)))
-        matrix_bytes = 0
-        for key in firsts:
-            p = key[:-len('net.0.proj.weight')]
-            for suffix in ('net.0.proj.weight', 'net.2.weight'):
-                shape = f.get_slice(p + suffix).get_shape()
-                matrix_bytes += shape[0] * shape[1]  # validated int8 when materialized below
         available = psutil.virtual_memory().available
         # Leave room for one temporary block and the notebook/OS. Avoid a huge speculative allocation.
-        if available < matrix_bytes + (4 << 30):
-            raise RuntimeError(f'Not enough host RAM: need {matrix_bytes/(1<<30):.2f} GiB cache + 4 GiB headroom; '
+        if available < budget_bytes + (4 << 30):
+            raise RuntimeError(f'Not enough host RAM: need {budget_bytes/(1<<30):.2f} GiB cache + 4 GiB headroom; '
                                f'available {available/(1<<30):.2f} GiB')
         print(f'48-block FF cache: about {matrix_bytes/(1<<30):.2f} GiB host RAM, '
               f'{matrix_bytes/2/(1<<30):.2f} GiB GPU weights per GPU.', flush=True)
+        print('Matrix storage types:', storage_dtypes, '| native dtypes preserved during transfers', flush=True)
         print('Loading only video FF tensors, not attention, text encoder or VAE...', flush=True)
         cache = [[], []]
         for i, key in enumerate(firsts):
@@ -50,22 +79,22 @@ def main():
             for suffix, axis in [('net.0.proj', 0), ('net.2', 1)]:
                 name = p + suffix
                 w = f.get_tensor(name + '.weight')
-                if w.dtype != torch.int8:
-                    raise RuntimeError('Expected int8 weight: ' + name)
-                if w.shape[axis] % 512:
+                if w.dtype not in (torch.int8, torch.float16, torch.bfloat16, torch.float32):
+                    raise RuntimeError('Unsupported FF weight dtype: ' + name)
+                if w.shape[axis] % (512 if w.dtype == torch.int8 else 2):
                     raise RuntimeError('Shard does not align to convrot groups: ' + name)
-                scale = f.get_tensor(name + '.weight_scale')
-                bias = f.get_tensor(name + '.bias').half() if name + '.bias' in keys else None
+                scale = f.get_tensor(name + '.weight_scale') if w.dtype == torch.int8 else None
+                bias = f.get_tensor(name + '.bias') if name + '.bias' in keys else None
                 half = w.shape[axis] // 2
                 for rank in (0, 1):
                     lo, hi = rank * half, (rank + 1) * half
                     part = w[lo:hi] if axis == 0 else w[:, lo:hi]
                     cache[rank].append(part.contiguous().pin_memory())
-                    if axis == 0 and scale.numel() > 1:
+                    if scale is not None and axis == 0 and scale.numel() > 1:
                         if scale.shape[0] != w.shape[0]:
                             raise RuntimeError('Unsupported row scale shape: ' + name)
                         cache[rank].append(scale[lo:hi].contiguous().pin_memory())
-                    else:
+                    elif scale is not None:
                         cache[rank].append(scale.contiguous().pin_memory())
                     if bias is not None:
                         if axis == 0:
@@ -125,12 +154,13 @@ def main():
     restore = statistics.median(restore_times)
     release = statistics.median(release_times)
     result = dict(blocks=48, pinned_host_gib=cache_bytes/(1<<30), cold_file_load_cache_sec=load_sec,
+                  matrix_storage_types=storage_dtypes,
                   median_restore_sec=restore, median_release_sec=release,
                   min_available_host_gib=min_available/(1<<30),
                   projected_ff_compute_saving_sec=estimate,
                   two_restore_release_cycles_sec=2*(restore+release),
                   illustrative_remaining_saving_sec=estimate-2*(restore+release),
-                  note='Empty-server feasibility test. Full pipeline placement, quality, TE/VAE pressure and speed remain untested.')
+                  note='Block-0 compute extrapolation may not represent mixed-precision layers. Empty-server transfer test; full pipeline placement, quality, TE/VAE pressure and speed remain untested.')
     out = Path('/kaggle/working/ltx_tp_ff_cache_probe.json')
     out.write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2), flush=True)
