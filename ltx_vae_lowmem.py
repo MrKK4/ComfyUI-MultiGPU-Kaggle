@@ -322,6 +322,24 @@ def _dual(self, x, pre, res, add, helper, tc_p):
     return True
 
 
+def _forward_diff_step(self, context, x_t, t):
+    """NADiffusionDecoder.forward_diff_step with the closing norm_out + conv_out run over frame chunks: the
+    original materializes norm_out(x) for the whole clip next to x and the context volume (3 x 4.2 GB at
+    1344x768x121). Both are per-token, so the output is the same."""
+    x = nd.patchify(x_t, patch_size_hw=self.patch_size, patch_size_t=1)
+    x = self.conv_in_x_t(x.permute(0, 2, 3, 4, 1))
+    t_emb = self.t_embedder(self.timestep_scale_multiplier * t, dtype=x.dtype)
+    modulation = self.shared_adaln(t_emb)
+    for block in self.diff_blocks:
+        x = block(x, context, modulation)
+    out = torch.empty(x.shape[:-1] + (self.conv_out.out_features,), dtype=x.dtype, device=x.device)
+    chunk = max(1, nd.MLP_TOKEN_CHUNK // max(x.shape[2] * x.shape[3], 1))
+    for t0 in range(0, x.shape[1], chunk):
+        out[:, t0:t0 + chunk] = self.conv_out(self.norm_out(x[:, t0:t0 + chunk]))
+    del x
+    return nd.unpatchify(out.permute(0, 4, 1, 2, 3), patch_size_hw=self.patch_size, patch_size_t=1)
+
+
 def forward(self, x, pre=None, add_to=None):
     batch, t, h, w, _ = x.shape
     tc = _chunk_frames(self, x)
@@ -352,7 +370,7 @@ def _gpu_free():
 def _decode_need(voxels):
     # last decoder stage keeps the residual stream and the context volume (512 tokens x 256 ch fp16 per latent
     # voxel each) for the whole clip; plus the VAE weights, pixel noise and chunk workspace
-    return 2 * voxels * 512 * 256 * 2 + 4 * 1024 ** 3
+    return 2 * voxels * 512 * 256 * 2 + int(4.5 * 1024 ** 3)
 
 
 def _park_dit(device, need):
@@ -485,6 +503,7 @@ def patch_ltx_vae_lowmem():
         return
     forward._mgpu_lowmem = True
     nd.NeighborhoodAttention3D.forward = forward
+    nd.NADiffusionDecoder.forward_diff_step = _forward_diff_step
     comfy.sd.VAE.decode = _dual_decode(comfy.sd.VAE.decode)
     comfy.sd.VAE.decode_tiled = _dual_decode(comfy.sd.VAE.decode_tiled)
     logger.info("[MultiGPU] LTX diffusion VAE: frame-chunked neighbourhood attention when the full clip does not fit%s",
