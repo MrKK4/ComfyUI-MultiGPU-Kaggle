@@ -602,6 +602,44 @@ class LTXTensorParallel:
         self.state = None
         self.checked = os.environ.get("LTX_TP_CHECK", "1") == "0"
         self.fallback_logged = False
+        # activation peak per video token, max over forwards (measured; the default is a guess for the first one)
+        self.act_per_tok = float(os.environ.get("LTX_TP_ACT_MB_PER_KTOK", "160")) * 2**20 / 1000
+        self.fwd_start = None
+        self.measured = False
+
+    def _is_dit(self, lm):
+        try:
+            return lm.model.model.diffusion_model.transformer_blocks is self.blocks
+        except AttributeError:
+            return False
+
+    def _make_room(self, tokens):
+        """Before a forward: other models staged on either GPU (the text encoder on GPU 1 stays after encoding) can leave
+        too little for this forward's activations, which double at 2 MP. Unload them (never the DiT) until the
+        estimated peak fits; the estimate comes from the largest measured peak per token so far."""
+        need = int(tokens * self.act_per_tok * 1.2) + (512 << 20)
+        for d in DEVICES:
+            if torch.cuda.mem_get_info(d)[0] >= need:
+                continue
+            keep = [lm for lm in comfy.model_management.current_loaded_models if self._is_dit(lm)]
+            with comfy.model_prefetch.pause_malloc_graph(sync=True):
+                gone = comfy.model_management.free_memory(need, d, keep_loaded=keep)
+                comfy.model_management.soft_empty_cache()
+            logger.info("[MultiGPU LTX TP] %d video tokens: need ~%.1f GB activations on %s, unloaded %s | %s", tokens, need / 2**30, d,
+                        ", ".join(type(getattr(m.model, "model", m.model)).__name__ for m in gone if m.model is not None) or "nothing",
+                        _gpu_free())
+
+    def _oom_report(self, i, tokens):
+        rows = []
+        for lm in comfy.model_management.current_loaded_models:
+            try:
+                rows.append("%s@%s %.1f GB" % (type(lm.model.model).__name__, lm.device, lm.model.loaded_size() / 2**30))
+            except Exception:
+                pass
+        logger.warning("[MultiGPU LTX TP] OUT OF MEMORY in block %d, %d video tokens | %s | %s | models: %s", i, tokens, _gpu_free(),
+                       " ".join("%s alloc %.2f peak %.2f reserved %.2f GB" % (d, torch.cuda.memory_allocated(d) / 2**30,
+                                torch.cuda.max_memory_allocated(d) / 2**30, torch.cuda.memory_reserved(d) / 2**30) for d in DEVICES),
+                       "; ".join(rows) or "-")
 
     def _load(self):
         need = int(sum(p.numel() * p.element_size() for p in self.blocks.parameters()) / 2 * 1.05)
@@ -669,8 +707,13 @@ class LTXTensorParallel:
             with comfy.model_prefetch.pause_malloc_graph(sync=True):
                 self._load()
         self.unpark()
-        st = self._inputs(i, args)
         vx, ax = args["img"]
+        if i == 0:
+            self._make_room(vx.shape[1])
+            for d in DEVICES:
+                torch.cuda.reset_peak_memory_stats(d)
+            self.fwd_start = [torch.cuda.memory_allocated(d) for d in DEVICES]
+        st = self._inputs(i, args)
         if st["x0"] is not None and st["x0"][0] is vx and st["x0"][1] is ax:
             x1 = st["x1"]
         else:
@@ -683,6 +726,9 @@ class LTXTensorParallel:
         try:
             out = block_forward([self.gpu[0][i], self.gpu[1][i]], [(vx, ax), x1], self.cadaln,
                                 transformer_options=[topts, topts], **st["kw"])
+        except torch.OutOfMemoryError:
+            self._oom_report(i, vx.shape[1])
+            raise
         except NotImplementedError as e:
             if not self.fallback_logged:
                 logger.warning("[MultiGPU LTX TP] %s: block %d runs on one GPU", e, i)
@@ -699,8 +745,13 @@ class LTXTensorParallel:
         if i == len(self.blocks) - 1:
             for d in DEVICES:
                 torch.cuda.synchronize(d)
-            logger.info("[MultiGPU LTX TP] forward: %d blocks, video %d tokens, %.2fs", len(self.blocks), vx.shape[1],
-                        time.perf_counter() - self.t_fwd)
+            peaks = [torch.cuda.max_memory_allocated(d) - s0 for d, s0 in zip(DEVICES, self.fwd_start or (0, 0))]
+            per_tok = max(peaks) / vx.shape[1]
+            self.act_per_tok = max(self.act_per_tok, per_tok) if self.measured else per_tok
+            self.measured = True
+            logger.info("[MultiGPU LTX TP] forward: %d blocks, video %d tokens, %.2fs | activation peak %.2f / %.2f GB on %s / %s",
+                        len(self.blocks), vx.shape[1], time.perf_counter() - self.t_fwd, peaks[0] / 2**30, peaks[1] / 2**30,
+                        DEVICES[0], DEVICES[1])
         return {"img": out[0]}
 
 
