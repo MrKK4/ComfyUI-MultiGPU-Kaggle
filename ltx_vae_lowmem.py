@@ -44,6 +44,7 @@ _HELPER_MARGIN = 1536 * 1024 * 1024   # the other GPU: na3d workspace, allocator
 _PRIMARY_MARGIN = 768 * 1024 * 1024   # the VAE's GPU: snapshot/copy-back staging beside its own chunks
 _STAGE_BYTES = 512 * 1024 * 1024  # two fixed pinned staging buffers between the GPUs (never resized)
 MIN_VOXELS = int(os.environ.get("LTX_VAE_DUAL_MIN_VOXELS", "9000"))  # latent t*h*w above which models are unloaded first
+PARK_CPU_GB = float(os.environ.get("LTX_VAE_PARK_CPU_GB", "6"))  # host RAM allowed for parked DiT blocks during a decode
 _LOGGED = set()
 _PINNED = {}
 _HELPER_WEIGHTS = {}
@@ -348,6 +349,72 @@ def _gpu_free():
                     for d in range(torch.cuda.device_count()))
 
 
+def _decode_need(voxels):
+    # last decoder stage keeps the residual stream and the context volume (512 tokens x 256 ch fp16 per latent
+    # voxel each) for the whole clip; plus the VAE weights, pixel noise and chunk workspace
+    return 2 * voxels * 512 * 256 * 2 + 4 * 1024 ** 3
+
+
+def _park_dit(device, need):
+    """Move DisTorch donor blocks off ``device`` until ``need`` bytes are free there: first into another GPU's
+    spare memory, then (up to PARK_CPU_GB) into host RAM. They run with comfy_cast_weights, so where they live
+    between sampling runs does not matter; _unpark puts them back. Returns [(module, device, bytes, target)]."""
+    free = torch.cuda.mem_get_info(device)[0]
+    if free >= need:
+        return []
+    blocks = []
+    for loaded in list(comfy.model_management.current_loaded_models):
+        patcher = getattr(loaded, "model", None)
+        model = getattr(patcher, "model", None)
+        if model is None or not hasattr(patcher, "_distorch_cached_assignments"):
+            continue
+        for m in model.modules():
+            if next(m.children(), None) is not None:
+                continue
+            tensors = list(m.parameters(recurse=False)) + list(m.buffers(recurse=False))
+            if tensors and all(x.device == device for x in tensors):
+                blocks.append((m, sum(x.numel() * x.element_size() for x in tensors)))
+    others = [torch.device("cuda", d) for d in range(torch.cuda.device_count()) if d != device.index]
+    spare = {o: torch.cuda.mem_get_info(o)[0] - 768 * 1024 ** 2 for o in others}
+    cpu_left = PARK_CPU_GB * 1024 ** 3
+    to_free, parked = need - free, []
+    for m, size in sorted(blocks, key=lambda b: -b[1]):
+        if to_free <= 0:
+            break
+        target = next((o for o in others if spare[o] > size), None)
+        if target is not None:
+            spare[target] -= size
+        elif cpu_left >= size:
+            target, cpu_left = torch.device("cpu"), cpu_left - size
+        else:
+            continue
+        m.to(target)
+        parked.append((m, device, size, target))
+        to_free -= size
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+    if parked:
+        moved = {}
+        for _, _, size, target in parked:
+            moved[str(target)] = moved.get(str(target), 0) + size
+        logger.info("[MultiGPU] LTX VAE decode: parked %.1f GB of DiT blocks from %s (%s), now %s",
+                    sum(moved.values()) / 2**30, device, ", ".join("%.1f GB to %s" % (v / 2**30, k) for k, v in moved.items()),
+                    _gpu_free())
+    return parked
+
+
+def _unpark(parked):
+    if not parked:
+        return
+    for d in range(torch.cuda.device_count()):
+        with torch.cuda.device(d):
+            torch.cuda.empty_cache()
+    for m, device, _, _ in parked:
+        m.to(device)
+    logger.info("[MultiGPU] LTX VAE decode: restored %.1f GB of DiT blocks to %s",
+                sum(p[2] for p in parked) / 2**30, parked[0][1])
+
+
 def _dual_decode(orig):
     def run(self, samples, *args, **kwargs):
         if not isinstance(getattr(self, "first_stage_model", None), nd.CausalDiffusionVAE):
@@ -357,7 +424,12 @@ def _dual_decode(orig):
         if voxels > MIN_VOXELS:
             logger.info("[MultiGPU] LTX VAE decode (%d latent voxels) on %s: %s", voxels, self.device, _gpu_free())
         if helper is None:
-            return orig(self, samples, *args, **kwargs)
+            device = torch.device(self.device)
+            parked = _park_dit(device, _decode_need(voxels)) if voxels > MIN_VOXELS and device.type == "cuda" else []
+            try:
+                return orig(self, samples, *args, **kwargs)
+            finally:
+                _unpark(parked)
         if voxels > MIN_VOXELS:
             # a large dual decode needs most of both GPUs: unload every model (the next job reloads them)
             for d in range(torch.cuda.device_count()):
