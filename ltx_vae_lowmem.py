@@ -583,6 +583,195 @@ def _vae_core_decode(orig):
     return run
 
 
+# ------------------------------------------------------------------------------------- dual-GPU tiled decode
+
+DUAL_TILES = os.environ.get("LTX_VAE_DUAL_TILES", "1") == "1"
+# measured on a T4 at 121 frames (ok-41, 2 MP): per-tile peak above the weights ~ 0.84 GB + 0.0233 GB per latent pixel
+# of tile area; ~0.079 s per latent pixel of tile area. LTX_VAE_TILE_S_PER_PX0/1 rebalance the split per GPU.
+_TILE_PEAK_GB = (0.84, 0.0233)
+_TILE_MARGIN_GB = 0.6
+_TILE_OVERHEAD_S = 1.0
+
+
+def _grid(length, n, ov):
+    """n tiles covering [0, length) with `ov` overlap: (tile size, start positions)."""
+    size = -(-(length + (n - 1) * ov) // n)
+    return size, [min(i * (size - ov), length - size) for i in range(n)]
+
+
+def _best_grid(h, w, max_h, max_w, max_area, ov, rate):
+    """Cheapest (time, nh, nw) grid for an h x w latent region within the tile limits, or None."""
+    best = None
+    for nh in range(1, h + 1):
+        th = _grid(h, nh, ov)[0]
+        if nh > 1 and th <= ov:
+            break
+        if th > max_h:
+            continue
+        for nw in range(1, w + 1):
+            tw = _grid(w, nw, ov)[0]
+            if nw > 1 and tw <= ov:
+                break
+            if tw > max_w or th * tw > max_area:
+                continue
+            t = nh * nw * (rate * th * tw + _TILE_OVERHEAD_S)
+            if best is None or t < best[0]:
+                best = (t, nh, nw)
+            break  # more columns only add tiles
+    return best
+
+
+def _plan_tiles(h, w, ov, limits):
+    """Split the latent width between GPU 1 (columns [0, s + ov)) and GPU 0 (columns [s, w)) so both finish together.
+    limits[r] = (max_h, max_w, max_area, s_per_px). Returns (est_time, [(rank, y0, y1, x0, x1), ...]) or None."""
+    best = None
+    for s in range(ov + 1, w - ov):
+        g1 = _best_grid(h, s + ov, *limits[1][:3], ov, limits[1][3])
+        g0 = _best_grid(h, w - s, *limits[0][:3], ov, limits[0][3])
+        if g1 is None or g0 is None:
+            continue
+        t = max(g1[0], g0[0])
+        if best is None or t < best[0]:
+            best = (t, s, g1, g0)
+    if best is None:
+        return None
+    t, s, g1, g0 = best
+    tiles = []
+    for rank, x_off, width, g in ((1, 0, s + ov, g1), (0, s, w - s, g0)):
+        th, ys = _grid(h, g[1], ov)
+        tw, xs = _grid(width, g[2], ov)
+        tiles += [(rank, y, y + th, x_off + x, x_off + x + tw) for y in ys for x in xs]
+    return t, tiles
+
+
+def _vae_copy(fsm, dev):
+    """Decode-only copy of a CausalDiffusionVAE on `dev` (built on meta, weights copied; no encoder)."""
+    with torch.device("meta"):
+        m = nd.CausalDiffusionVAE(config=fsm.config)
+    del m.encoder
+    sd = {k: v.detach().to(dev, copy=True) for k, v in fsm.state_dict().items() if not k.startswith("encoder.")}
+    m.load_state_dict(sd, strict=False, assign=True)
+    for name, b in fsm.named_buffers():
+        if name.startswith("encoder."):
+            continue
+        mod, _, attr = name.rpartition(".")
+        sub = m.get_submodule(mod)
+        if sub._buffers.get(attr) is not None and sub._buffers[attr].is_meta:
+            sub._buffers[attr] = b.detach().to(dev, copy=True)
+    left = [n for n, x in list(m.named_parameters()) + list(m.named_buffers()) if x.is_meta]
+    if left:
+        raise RuntimeError("VAE copy left on meta: %s" % left[:5])
+    return m.eval()
+
+
+def _feather(n, f):
+    r = torch.ones(n)
+    if f < n:
+        for t in range(f):
+            r[t] = r[n - 1 - t] = (t + 1) / f  # ComfyUI tiled_scale_multidim's mask
+    return r
+
+
+def _dual_tiled_3d(orig):
+    """VAE.decode_tiled_3d for the LTX diffusion VAE with the tiles split over both GPUs. Same tiles-and-feather blend as
+    ComfyUI (whole clip per tile when tile_t covers it); GPU 0 holds the tensor-parallel shards, so it gets smaller
+    tiles sized to its free memory and a share of the width that makes both GPUs finish together. A GPU-0 tile that
+    runs out of memory is redone on the VAE's GPU. LTX_VAE_DUAL_TILES=0 turns it off."""
+    def run(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
+        fsm = getattr(self, "first_stage_model", None)
+        dev1 = torch.device(self.device)
+        if (not DUAL_TILES or not isinstance(fsm, nd.CausalDiffusionVAE) or dev1.type != "cuda"
+                or torch.cuda.device_count() < 2 or samples.shape[2] > tile_t or samples.shape[0] != 1):
+            return orig(self, samples, tile_t, tile_x, tile_y, overlap)
+        dev0 = torch.device("cuda", 1 - dev1.index if dev1.index in (0, 1) else 0)
+        _, _, t, h, w = samples.shape
+        ov = int(overlap[1]) if isinstance(overlap, (tuple, list)) else int(overlap)
+        comfy.model_management.free_memory(1e30, dev0)  # DiT non-block weights, upsampler: reloaded by the next job
+        comfy.model_management.soft_empty_cache()
+        t_copy = time.perf_counter()
+        try:
+            m0 = _vae_copy(fsm, dev0)
+        except torch.OutOfMemoryError:
+            logger.warning("[MultiGPU] LTX VAE dual tiles: no room for a VAE copy on %s (%s), one GPU", dev0, _gpu_free())
+            return orig(self, samples, tile_t, tile_x, tile_y, overlap)
+        t_copy = time.perf_counter() - t_copy
+        frames = max(1, t * 8 - 7) / 121
+        a, b = _TILE_PEAK_GB
+        limits = {}
+        for r, d in ((0, dev0), (1, dev1)):
+            free = torch.cuda.mem_get_info(d)[0] / 2**30 - _TILE_MARGIN_GB
+            area = int((free / frames - a) / b)
+            rate = float(os.environ.get("LTX_VAE_TILE_S_PER_PX%d" % r, "0.079")) * frames
+            limits[r] = (tile_y, tile_x, area, rate) if r == 1 else (h, w, area, rate)
+        plan = _plan_tiles(h, w, ov, limits)
+        if plan is None or not any(x[0] == 0 for x in plan[1]):
+            logger.info("[MultiGPU] LTX VAE dual tiles: no useful split (limits %s), one GPU", limits)
+            del m0
+            with torch.cuda.device(dev0):
+                torch.cuda.empty_cache()
+            return orig(self, samples, tile_t, tile_x, tile_y, overlap)
+        est, tiles = plan
+        logger.info("[MultiGPU] LTX VAE dual tiles: latent %dx%d, %d tiles on %s + %d on %s, est %.0fs | VAE copy %.1fs | "
+                    "max tile area %d / %d latent px | %s", h, w, sum(x[0] == 1 for x in tiles), dev1,
+                    sum(x[0] == 0 for x in tiles), dev0, est, t_copy, limits[1][2], limits[0][2], _gpu_free())
+
+        out_dtype = self.vae_output_dtype()
+        out = torch.zeros((1, self.output_channels, max(1, t * 8 - 7), h * 32, w * 32), device=self.output_device)
+        div = torch.zeros((1, 1, 1, h * 32, w * 32), device=self.output_device)
+        f = ov * 32
+        lock = threading.Lock()
+        redo, errors, stats = [], [], {0: [0, 0.0], 1: [0, 0.0]}
+
+        def decode(model, dev, tile):
+            _, y0, y1, x0, x1 = tile
+            z = samples[:, :, :, y0:y1, x0:x1].to(self.vae_dtype).to(dev)
+            ps = model.decode(z).to(dtype=out_dtype).to(self.output_device)
+            mask = (_feather(ps.shape[3], f)[:, None] * _feather(ps.shape[4], f)[None, :]).to(ps)
+            ps.mul_(mask)
+            with lock:
+                out[:, :, :, y0 * 32:y1 * 32, x0 * 32:x1 * 32] += ps
+                div[:, :, :, y0 * 32:y1 * 32, x0 * 32:x1 * 32] += mask
+
+        def worker(r, dev, model, mine):
+            try:
+                with torch.cuda.device(dev), torch.inference_mode():
+                    for i, tile in enumerate(mine):
+                        t0 = time.perf_counter()
+                        try:
+                            decode(model, dev, tile)
+                        except torch.OutOfMemoryError:
+                            if r == 1:
+                                raise
+                            torch.cuda.empty_cache()
+                            logger.warning("[MultiGPU] LTX VAE dual tiles: out of memory on %s for tile %s, %d tile(s) moved to %s | %s",
+                                           dev, tile[1:], len(mine) - i, dev1, _gpu_free())
+                            redo.extend(mine[i:])
+                            return
+                        stats[r][0] += 1
+                        stats[r][1] += time.perf_counter() - t0
+            except BaseException as e:  # re-raised in the caller
+                errors.append(e)
+
+        t0 = time.perf_counter()
+        th0 = threading.Thread(target=worker, args=(0, dev0, m0, [x for x in tiles if x[0] == 0]), name="ltx-vae-tiles0")
+        th0.start()
+        worker(1, dev1, fsm, [x for x in tiles if x[0] == 1])
+        th0.join()
+        if redo and not errors:
+            worker(1, dev1, fsm, redo)
+        del m0
+        with torch.cuda.device(dev0):
+            torch.cuda.empty_cache()
+        if errors:
+            raise errors[0]
+        logger.info("[MultiGPU] LTX VAE dual tiles: done in %.1fs | %s %d tiles %.1fs, %s %d tiles %.1fs%s", time.perf_counter() - t0,
+                    dev1, stats[1][0], stats[1][1], dev0, stats[0][0], stats[0][1],
+                    " (%d redone on %s)" % (len(redo), dev1) if redo else "")
+        out.div_(div)
+        return self.process_output(out)
+    return run
+
+
 def patch_ltx_vae_lowmem():
     if getattr(nd.NeighborhoodAttention3D.forward, "_mgpu_lowmem", False):
         return
@@ -592,5 +781,6 @@ def patch_ltx_vae_lowmem():
     nd.CausalDiffusionVAE.decode = _vae_core_decode(nd.CausalDiffusionVAE.decode)
     comfy.sd.VAE.decode = _dual_decode(comfy.sd.VAE.decode)
     comfy.sd.VAE.decode_tiled = _dual_decode(comfy.sd.VAE.decode_tiled)
+    comfy.sd.VAE.decode_tiled_3d = _dual_tiled_3d(comfy.sd.VAE.decode_tiled_3d)
     logger.info("[MultiGPU] LTX diffusion VAE: frame-chunked neighbourhood attention when the full clip does not fit%s",
                 " (dual GPU on)" if DUAL else "")
