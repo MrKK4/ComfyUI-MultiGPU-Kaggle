@@ -40,8 +40,9 @@ logger = logging.getLogger("MultiGPU")
 
 try:
     from . import ltx_tensor_parallel as _tp
+    from . import ltx_te_diag as _te
 except ImportError:  # loaded standalone (tests)
-    _tp = None
+    _tp = _te = None
 
 FORCE_CHUNK_FRAMES = None  # tests: fixed chunk length instead of the free-VRAM fit
 FORCE_DUAL = False         # tests: split frames over both GPUs even when the clip fits
@@ -76,11 +77,9 @@ def _chunk_frames(self, x):
     frame = x.shape[0] * h * w * self.dim * x.element_size()
     free = comfy.model_management.get_free_memory(x.device) - _RESERVE
     # original forward: full-clip q, k, v, out + one qkv slice of at most 2**25 elements per tensor
-    cap = _TC_CAP.get((tuple(x.shape), x.device))
-    if cap is None and free >= 4 * t * frame + 4 * (2 ** 25) * x.element_size():
+    if free >= 4 * t * frame + 4 * (2 ** 25) * x.element_size():
         return t
-    tc = max(_fit(free, frame, halo), halo, 1)
-    return tc if cap is None else min(tc, cap)
+    return max(_fit(free, frame, halo), halo, 1)
 
 
 def _helper_device(device):
@@ -221,7 +220,6 @@ def _run_chunks(self, x, pre, res, add, chunks, tables, q_weight, k_weight):
             logger.warning("[MultiGPU] LTX VAE attention %s: out of memory at a %d-frame chunk (frame %d), retrying with "
                            "%d-frame chunks | %s", tuple(x.shape[:4]), tc, t0, max(tc // 2, halo, 1), _gpu_free())
             _LAST_NA["retries"] = _LAST_NA.get("retries", 0) + 1
-            _TC_CAP[(tuple(x.shape), x.device)] = max(tc // 2, halo, 1)  # later layers of this decode start there
             chunks = chunks[:j] + new
             continue
         pending.append((t0, t1, py))
@@ -535,6 +533,8 @@ def _dual_decode(orig):
                 return orig(self, samples, *args, **kwargs)
             finally:
                 _unpark(parked)
+                if _te is not None and voxels > MIN_VOXELS:
+                    _te.prefetch_text_encoders()  # the next prompt's encode would re-read them from disk
         if voxels > MIN_VOXELS:
             # a large dual decode needs most of both GPUs: unload every model (the next job reloads them)
             for d in range(torch.cuda.device_count()):
@@ -554,7 +554,6 @@ def _dual_decode(orig):
 
 
 _LAST_NA = {}
-_TC_CAP = {}  # (stage shape, device) -> chunk length that fitted after an out-of-memory retry, for the rest of a decode
 
 
 def _vae_core_decode(orig):
@@ -566,7 +565,6 @@ def _vae_core_decode(orig):
         if dev.type != "cuda":
             return orig(self, x)
         _LAST_NA.clear()
-        _TC_CAP.clear()
         torch.cuda.reset_peak_memory_stats(dev)
         start, t0 = torch.cuda.memory_allocated(dev), time.perf_counter()
         try:
