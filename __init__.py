@@ -21,6 +21,7 @@ from .h3_ref_cache import patch_minimax_h3_ref_cache
 from .sam3_profile import patch_sam3_profile
 from .ltx_vae_lowmem import patch_ltx_vae_lowmem
 from .ltx_block_capture import install_block_capture
+from .ltx_te_diag import install_te_diag
 from .ltx_tensor_parallel import UNETLoaderLTXTensorParallel
 from .h3_tensor_parallel import UNETLoaderH3TensorParallel
 from .h3_dual_vae import VAEDecodeH3DualGPU, VAEEncodeH3DualGPU
@@ -616,6 +617,7 @@ patch_minimax_h3_ref_cache()
 patch_sam3_profile()
 patch_ltx_vae_lowmem()
 install_block_capture()
+install_te_diag()
 _initialize_aimdo_visible_cuda_devices()
 
 from .nodes import (

@@ -76,9 +76,11 @@ def _chunk_frames(self, x):
     frame = x.shape[0] * h * w * self.dim * x.element_size()
     free = comfy.model_management.get_free_memory(x.device) - _RESERVE
     # original forward: full-clip q, k, v, out + one qkv slice of at most 2**25 elements per tensor
-    if free >= 4 * t * frame + 4 * (2 ** 25) * x.element_size():
+    cap = _TC_CAP.get((tuple(x.shape), x.device))
+    if cap is None and free >= 4 * t * frame + 4 * (2 ** 25) * x.element_size():
         return t
-    return max(_fit(free, frame, halo), halo, 1)
+    tc = max(_fit(free, frame, halo), halo, 1)
+    return tc if cap is None else min(tc, cap)
 
 
 def _helper_device(device):
@@ -219,6 +221,7 @@ def _run_chunks(self, x, pre, res, add, chunks, tables, q_weight, k_weight):
             logger.warning("[MultiGPU] LTX VAE attention %s: out of memory at a %d-frame chunk (frame %d), retrying with "
                            "%d-frame chunks | %s", tuple(x.shape[:4]), tc, t0, max(tc // 2, halo, 1), _gpu_free())
             _LAST_NA["retries"] = _LAST_NA.get("retries", 0) + 1
+            _TC_CAP[(tuple(x.shape), x.device)] = max(tc // 2, halo, 1)  # later layers of this decode start there
             chunks = chunks[:j] + new
             continue
         pending.append((t0, t1, py))
@@ -551,6 +554,7 @@ def _dual_decode(orig):
 
 
 _LAST_NA = {}
+_TC_CAP = {}  # (stage shape, device) -> chunk length that fitted after an out-of-memory retry, for the rest of a decode
 
 
 def _vae_core_decode(orig):
@@ -562,6 +566,7 @@ def _vae_core_decode(orig):
         if dev.type != "cuda":
             return orig(self, x)
         _LAST_NA.clear()
+        _TC_CAP.clear()
         torch.cuda.reset_peak_memory_stats(dev)
         start, t0 = torch.cuda.memory_allocated(dev), time.perf_counter()
         try:

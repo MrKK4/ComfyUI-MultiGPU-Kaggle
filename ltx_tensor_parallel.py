@@ -203,7 +203,7 @@ def _ev(dev):
     return e
 
 
-CHUNKS = max(1, int(os.environ.get("LTX_TP_CHUNKS", "4")))
+CHUNKS = max(1, int(os.environ.get("LTX_TP_CHUNKS", "8")))  # 8 measured fastest (block test, 1 MP stage 2)
 _CHUNK_MIN_BYTES = 16 << 20  # tensors below this go in one piece
 
 
@@ -274,8 +274,87 @@ class Exchange:
             STATS["n_" + tag] += 1
         return out
 
+    def allreduce_produce(self, produce, shape, dtype, tag):
+        """Sum of per-rank partials that are produced chunk by chunk: produce(r, lo, hi) returns rank r's partial for
+        token rows [lo, hi), computed on rank r's compute stream. Each chunk goes to the host as soon as it exists, so
+        its round trip overlaps the next chunk's compute; the other rank's chunk lands straight in the output and the
+        own chunk is added to it (rank 0: p1 + p0, rank 1: p0 + p1, the same values). Returns per-rank full sums."""
+        t0 = time.perf_counter() if TIMING else None
+        if TIMING:
+            for d in DEVICES:
+                torch.cuda.synchronize(d)
+            t_ready = time.perf_counter()
+        if self.streams is None:
+            self.streams = [(torch.cuda.Stream(d), torch.cuda.Stream(d)) for d in DEVICES]
+        shape = tuple(shape)
+        nbytes = torch.empty((), dtype=dtype).element_size()
+        for n in shape:
+            nbytes *= n
+        k = CHUNKS if nbytes >= _CHUNK_MIN_BYTES and shape[1] >= CHUNKS else 1
+        bounds = [(shape[1] * j // k, shape[1] * (j + 1) // k) for j in range(k)]
+        key = ("produce", tag, shape, dtype, k)
+        buf = self.bufs.get(key)
+        if buf is None:
+            buf = self.bufs[key] = {"host": [torch.empty(shape, dtype=dtype, pin_memory=True) for _ in DEVICES],
+                                    "read": [None, None]}
+        out, alloc = [], []
+        for dev in DEVICES:
+            with torch.cuda.device(dev):
+                out.append(torch.empty(shape, dtype=dtype, device=dev))
+                alloc.append(_ev(dev))
+        parts = [[None] * k for _ in DEVICES]
+        sent = [[None] * k for _ in DEVICES]
+        reads = [[None] * k for _ in DEVICES]
+
+        def push(j):
+            lo, hi = bounds[j]
+            for r, dev in enumerate(DEVICES):
+                with torch.cuda.device(dev):
+                    parts[r][j] = produce(r, lo, hi)
+                    d2h = self.streams[r][0]
+                    d2h.wait_event(_ev(dev))
+                    if buf["read"][1 - r] is not None:
+                        d2h.wait_event(buf["read"][1 - r][j])
+                    with torch.cuda.stream(d2h):
+                        buf["host"][r][:, lo:hi].copy_(parts[r][j], non_blocking=True)
+                    sent[r][j] = torch.cuda.Event()
+                    sent[r][j].record(d2h)
+
+        def pull(j):
+            lo, hi = bounds[j]
+            for r, dev in enumerate(DEVICES):
+                with torch.cuda.device(dev):
+                    comp, h2d = torch.cuda.current_stream(dev), self.streams[r][1]
+                    h2d.wait_event(sent[1 - r][j])
+                    if j == 0:
+                        h2d.wait_event(alloc[r])
+                    with torch.cuda.stream(h2d):
+                        out[r][:, lo:hi].copy_(buf["host"][1 - r][:, lo:hi], non_blocking=True)
+                    reads[r][j] = torch.cuda.Event()
+                    reads[r][j].record(h2d)
+                    comp.wait_event(reads[r][j])
+                    out[r][:, lo:hi] += parts[r][j]
+                    comp.wait_event(sent[r][j])  # the partial's copy-out is done before it is freed
+                    parts[r][j] = None
+
+        for j in range(k):
+            push(j)
+            if j:
+                pull(j - 1)
+        pull(k - 1)
+        buf["read"] = reads
+        if TIMING:
+            for d in DEVICES:
+                torch.cuda.synchronize(d)
+            STATS["compute_" + tag] += t_ready - t0
+            STATS["xchg_" + tag] += time.perf_counter() - t_ready  # includes the overlapped producing compute
+            STATS["xchg_bytes_" + tag] += nbytes
+            STATS["n_" + tag] += 1
+        return out
+
 
 XCHG = Exchange()
+OVERLAP = os.environ.get("LTX_TP_OVERLAP", "1") != "0"  # produce row-parallel outputs chunk-wise behind the exchange
 
 
 # ----------------------------------------------------------------------------------------------- compute
@@ -347,17 +426,24 @@ def _attention(sh, name, xs, ctxs, pe, k_pe, mask, topts, tag):
             b_, t_, _ = out[r].shape
             return (out[r].view(b_, t_, heads, -1) * g.unsqueeze(-1)).view(b_, t_, -1)
         out = _ranks(gated)
-    part = _ranks(lambda r: _lin(out[r], a[r]["to_out"]))
-    res = XCHG.allreduce(part, tag)
+    if OVERLAP:
+        res = XCHG.allreduce_produce(lambda r, lo, hi: _lin(out[r][:, lo:hi], a[r]["to_out"]),
+                                     tuple(xs[0].shape[:-1]) + (a[0]["to_out"].w.shape[0],), xs[0].dtype, tag)
+    else:
+        res = XCHG.allreduce(_ranks(lambda r: _lin(out[r], a[r]["to_out"])), tag)
     _record(name, res)
     return res
 
 
 def _ff(sh, name, xs, tag):
     f = [sh[r][name] for r in range(2)]
-    h = _ranks(lambda r: _lin(xs[r], f[r]["proj"]))
-    part = _ranks(lambda r: _lin(h[r], f[r]["out"], act="gelu_tanh"))
-    res = XCHG.allreduce(part, tag)
+    if OVERLAP:
+        # both projections per token chunk: the hidden activation never exists for the whole clip
+        res = XCHG.allreduce_produce(lambda r, lo, hi: _lin(_lin(xs[r][:, lo:hi], f[r]["proj"]), f[r]["out"], act="gelu_tanh"),
+                                     tuple(xs[0].shape[:-1]) + (f[0]["out"].w.shape[0],), xs[0].dtype, tag)
+    else:
+        h = _ranks(lambda r: _lin(xs[r], f[r]["proj"]))
+        res = XCHG.allreduce(_ranks(lambda r: _lin(h[r], f[r]["out"], act="gelu_tanh")), tag)
     _record(name, res)
     return res
 
