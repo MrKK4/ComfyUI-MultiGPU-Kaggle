@@ -40,9 +40,8 @@ logger = logging.getLogger("MultiGPU")
 
 try:
     from . import ltx_tensor_parallel as _tp
-    from . import ltx_te_diag as _te
 except ImportError:  # loaded standalone (tests)
-    _tp = _te = None
+    _tp = None
 
 FORCE_CHUNK_FRAMES = None  # tests: fixed chunk length instead of the free-VRAM fit
 FORCE_DUAL = False         # tests: split frames over both GPUs even when the clip fits
@@ -533,8 +532,6 @@ def _dual_decode(orig):
                 return orig(self, samples, *args, **kwargs)
             finally:
                 _unpark(parked)
-                if _te is not None and voxels > MIN_VOXELS:
-                    _te.prefetch_text_encoders()  # the next prompt's encode would re-read them from disk
         if voxels > MIN_VOXELS:
             # a large dual decode needs most of both GPUs: unload every model (the next job reloads them)
             for d in range(torch.cuda.device_count()):
