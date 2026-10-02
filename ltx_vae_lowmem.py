@@ -200,19 +200,39 @@ def _norm_weights(self, dtype):
 
 
 def _run_chunks(self, x, pre, res, add, chunks, tables, q_weight, k_weight):
-    pending = []
-    for j, (t0, t1, a, b) in enumerate(chunks):
-        src = (lambda f0, f1: x[:, f0:f1]) if pre is None else (lambda f0, f1: pre(x[:, f0:f1]))
-        pending.append((t0, t1, _attend(self, src, a, b, t0, t1, x.shape[1], tables, q_weight, k_weight,
-                                        self.qkv.weight, self.qkv.bias, self.proj)))
+    """Run the chunks; on out of memory, re-plan the remaining frames with half the chunk length and go on (exact:
+    every frame the new chunks read is still unwritten). Raises if it cannot shrink further or would read a
+    written frame."""
+    t, halo, kt = x.shape[1], self.kernel_size[0] // 2, self.kernel_size[0]
+    src = (lambda f0, f1: x[:, f0:f1]) if pre is None else (lambda f0, f1: pre(x[:, f0:f1]))
+    pending, written, j = [], 0, 0
+    while j < len(chunks):
+        t0, t1, a, b = chunks[j]
+        try:
+            py = _attend(self, src, a, b, t0, t1, t, tables, q_weight, k_weight, self.qkv.weight, self.qkv.bias, self.proj)
+        except torch.OutOfMemoryError:
+            tc = t1 - t0
+            new = _chunks(t0, t, max(tc // 2, halo, 1), t, halo, kt)
+            if tc <= max(halo, 1) or min(c[2] for c in new) < written:
+                raise
+            torch.cuda.empty_cache()
+            logger.warning("[MultiGPU] LTX VAE attention %s: out of memory at a %d-frame chunk (frame %d), retrying with "
+                           "%d-frame chunks | %s", tuple(x.shape[:4]), tc, t0, max(tc // 2, halo, 1), _gpu_free())
+            _LAST_NA["retries"] = _LAST_NA.get("retries", 0) + 1
+            chunks = chunks[:j] + new
+            continue
+        pending.append((t0, t1, py))
+        del py
         # in place: a result is written only once no later chunk reads those frames
-        next_read = min((c[2] for c in chunks[j + 1:]), default=x.shape[1])
+        next_read = min((c[2] for c in chunks[j + 1:]), default=t)
         while pending and pending[0][1] <= next_read:
             p0, p1, py = pending.pop(0)
             if add:
                 res[:, p0:p1] += py
             else:
                 res[:, p0:p1] = py
+            written = max(written, p1)
+        j += 1
 
 
 def _log_oom(dev, what):

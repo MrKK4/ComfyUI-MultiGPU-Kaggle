@@ -41,7 +41,8 @@ ATTNS = ("attn1", "attn2", "audio_attn1", "audio_attn2", "audio_to_video_attn", 
 FFS = ("ff", "audio_ff")
 TABLES = ("scale_shift_table", "audio_scale_shift_table", "prompt_scale_shift_table", "audio_prompt_scale_shift_table",
           "scale_shift_table_a2v_ca_audio", "scale_shift_table_a2v_ca_video")
-TIMING = os.environ.get("LTX_TP_TIMING", "0") == "1"  # sync around every exchange and report where the time goes
+TIMING = os.environ.get("LTX_TP_TIMING", "0") == "1"
+PIN_HOST = os.environ.get("LTX_TP_PIN_HOST", "1") != "0"  # GPU 1 shard host copy pinned (fast restore) or pageable  # sync around every exchange and report where the time goes
 
 
 # ----------------------------------------------------------------------------------------------- shards
@@ -521,10 +522,11 @@ class LTXTensorParallel:
         for d in DEVICES:
             comfy.model_management.free_memory(need + (1 << 30), d)
         t0 = time.perf_counter()
-        self.gpu, self.host = load_all_shards(self.path, len(self.blocks))
-        logger.info("[MultiGPU LTX TP] %d blocks sharded in %.0fs: %.2f / %.2f GB on %s / %s | %s", len(self.blocks),
-                    time.perf_counter() - t0, sum(map(shard_bytes, self.gpu[0])) / 2**30,
-                    sum(map(shard_bytes, self.gpu[1])) / 2**30, DEVICES[0], DEVICES[1], _gpu_free())
+        self.gpu, self.host = load_all_shards(self.path, len(self.blocks), PIN_HOST)
+        logger.info("[MultiGPU LTX TP] %d blocks sharded in %.0fs: %.2f / %.2f GB on %s / %s, GPU 1 host copy %s | %s | %s",
+                    len(self.blocks), time.perf_counter() - t0, sum(map(shard_bytes, self.gpu[0])) / 2**30,
+                    sum(map(shard_bytes, self.gpu[1])) / 2**30, DEVICES[0], DEVICES[1],
+                    "pinned" if PIN_HOST else "pageable", _gpu_free(), _ram())
 
     def park(self):
         """Drop GPU 1's shards (host copies kept) so another model can use GPU 1."""
@@ -569,6 +571,14 @@ class LTXTensorParallel:
         return self.state
 
     def block(self, i, args, original):
+        if i == 0:
+            for d in DEVICES:
+                torch.cuda.synchronize(d)
+            self.t_fwd = time.perf_counter()
+            if not getattr(self, "first_block_logged", True):
+                self.first_block_logged = True
+                logger.info("[MultiGPU LTX TP] forward: prefetch_dynamic_vbars=%s (False = unused block weights not paged in)",
+                            args["transformer_options"].get("prefetch_dynamic_vbars"))
         if self.gpu is None:
             with comfy.model_prefetch.pause_malloc_graph(sync=True):
                 self._load()
@@ -600,6 +610,11 @@ class LTXTensorParallel:
                 drift = float((out[0][s].float() - out[1][s].float().to(DEVICES[0])).abs().max())
                 logger.info("[MultiGPU LTX TP] block %d check, %s: rel err vs one GPU %.2e, replica drift %.2e", i, name, rel, drift)
         st["x0"], st["x1"] = out[0], out[1]
+        if i == len(self.blocks) - 1:
+            for d in DEVICES:
+                torch.cuda.synchronize(d)
+            logger.info("[MultiGPU LTX TP] forward: %d blocks, video %d tokens, %.2fs", len(self.blocks), vx.shape[1],
+                        time.perf_counter() - self.t_fwd)
         return {"img": out[0]}
 
 
@@ -610,15 +625,45 @@ def park_for(device):
             tp.park()
 
 
+def _topts(args, kwargs):
+    """transformer_options of a diffusion-model call: LTX passes (x, timestep, context, attention_mask, frame_rate,
+    transformer_options, ...), so find it by content, not position."""
+    t = kwargs.get("transformer_options")
+    if isinstance(t, dict):
+        return t
+    for a in args:
+        if isinstance(a, dict) and ("patches_replace" in a or "prefetch_dynamic_vbars" in a or "cond_or_uncond" in a):
+            return a
+    return None
+
+
+_PREFETCH_LOGGED = []
+
+
 def _no_block_prefetch(executor, *args, **kwargs):
     # the model's own block weights are unused; prefetching would page all of them in every step
-    topts = kwargs.get("transformer_options", args[3] if len(args) > 3 else None)
-    if topts is not None:
+    topts = _topts(args, kwargs)
+    if topts is None:
+        if not _PREFETCH_LOGGED:
+            _PREFETCH_LOGGED.append(1)
+            logger.warning("[MultiGPU LTX TP] transformer_options not found in the diffusion model call: block prefetch stays ON "
+                           "(the unused block weights get paged in every step)")
+    else:
         topts["prefetch_dynamic_vbars"] = False
     return executor(*args, **kwargs)
 
 
+def _ram():
+    try:
+        mi = dict(l.split(":", 1) for l in open("/proc/meminfo"))
+        return "host RAM available %.1f GB" % (int(mi["MemAvailable"].split()[0]) / 2**20)
+    except Exception:
+        return "host RAM ?"
+
+
 def _sampling(tp, executor, *args, **kwargs):
+    logger.info("[MultiGPU LTX TP] sampling run starts | %s | %s", _gpu_free(), _ram())
+    tp.first_block_logged = False
     patched = [k for k in getattr(executor.class_obj.model_patcher, "patches", {}) if ".transformer_blocks." in k]
     if patched:
         logger.warning("[MultiGPU LTX TP] %d LoRA/patch keys on transformer blocks are NOT applied under tensor parallel "
@@ -628,7 +673,7 @@ def _sampling(tp, executor, *args, **kwargs):
         return executor(*args, **kwargs)
     finally:
         tp.state = None
-        logger.info("[MultiGPU LTX TP] sampling run %.1fs | %s", time.perf_counter() - t0, _gpu_free())
+        logger.info("[MultiGPU LTX TP] sampling run %.1fs | %s | %s", time.perf_counter() - t0, _gpu_free(), _ram())
 
 
 class UNETLoaderLTXTensorParallel:
