@@ -402,7 +402,8 @@ def _attention(sh, name, xs, ctxs, pe, k_pe, mask, topts, tag):
     inner = a[0]["inner"]
     heads = HEADS[name] // 2
     if self_attn and topts[0].get("stg_skip_self_attn", False):
-        out = v
+        def core(r, lo, hi):
+            return v[r][:, lo:hi]
     else:
         # q_norm / k_norm span all heads: exchange the per-token sums of squares of both halves
         tq = _ranks(lambda r: q[r].float().square().sum(-1, keepdim=True))
@@ -418,19 +419,27 @@ def _attention(sh, name, xs, ctxs, pe, k_pe, mask, topts, tag):
             else:
                 q = _ranks(lambda r: apply_rotary_emb(q[r], pe[r]))
                 k = _ranks(lambda r: apply_rotary_emb(k[r], pe[r] if k_pe is None else k_pe[r]))
-        out = _ranks(lambda r: optimized_attention(q[r], k[r], v[r], heads, mask=None if mask is None else mask[r],
-                                                   transformer_options=topts[r]))
-    if a[0]["gate"] is not None:
-        def gated(r):
-            g = 2.0 * torch.sigmoid(_lin(xs[r], a[r]["gate"]))
-            b_, t_, _ = out[r].shape
-            return (out[r].view(b_, t_, heads, -1) * g.unsqueeze(-1)).view(b_, t_, -1)
-        out = _ranks(gated)
+        def core(r, lo, hi):
+            # query rows are independent: rows [lo, hi) attend to every key, so a query chunk is exact
+            return optimized_attention(q[r][:, lo:hi].contiguous(), k[r], v[r], heads, transformer_options=topts[r])
+
+    def head_out(r, lo, hi):
+        o = core(r, lo, hi)
+        if a[r]["gate"] is not None:
+            g = 2.0 * torch.sigmoid(_lin(xs[r][:, lo:hi], a[r]["gate"]))
+            b_, t_, _ = o.shape
+            o = (o.view(b_, t_, heads, -1) * g.unsqueeze(-1)).view(b_, t_, -1)
+        return _lin(o, a[r]["to_out"])
+
+    if mask is not None:
+        # a mask would need slicing per query chunk: whole clip at once (TP rejects masked blocks before this anyway)
+        out = _ranks(lambda r: optimized_attention(q[r], k[r], v[r], heads, mask=mask[r], transformer_options=topts[r]))
+        core = lambda r, lo, hi: out[r][:, lo:hi]  # noqa: E731
     if OVERLAP:
-        res = XCHG.allreduce_produce(lambda r, lo, hi: _lin(out[r][:, lo:hi], a[r]["to_out"]),
-                                     tuple(xs[0].shape[:-1]) + (a[0]["to_out"].w.shape[0],), xs[0].dtype, tag)
+        # attention, gate and to_out per query chunk: chunk j's partial goes to the other GPU while chunk j+1 is computed
+        res = XCHG.allreduce_produce(head_out, tuple(xs[0].shape[:-1]) + (a[0]["to_out"].w.shape[0],), xs[0].dtype, tag)
     else:
-        res = XCHG.allreduce(_ranks(lambda r: _lin(out[r], a[r]["to_out"])), tag)
+        res = XCHG.allreduce(_ranks(lambda r: head_out(r, 0, xs[r].shape[1])), tag)
     _record(name, res)
     return res
 
