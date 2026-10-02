@@ -752,6 +752,13 @@ class LTXTensorParallel:
             logger.info("[MultiGPU LTX TP] forward: %d blocks, video %d tokens, %.2fs | activation peak %.2f / %.2f GB on %s / %s",
                         len(self.blocks), vx.shape[1], time.perf_counter() - self.t_fwd, peaks[0] / 2**30, peaks[1] / 2**30,
                         DEVICES[0], DEVICES[1])
+            if TIMING:  # LTX_TP_TIMING=1: per sublayer, compute before each exchange vs the exchange (GPUs synced around it)
+                tags = sorted({k[5:] for k in STATS if k.startswith("xchg_") and not k.startswith("xchg_bytes_")})
+                logger.info("[MultiGPU LTX TP] timing, %d tokens: compute %.2fs, exchange %.2fs | %s", vx.shape[1],
+                            sum(STATS["compute_" + t] for t in tags), sum(STATS["xchg_" + t] for t in tags),
+                            "; ".join("%s n=%d %.2f+%.2fs %.0fMB" % (t, STATS["n_" + t], STATS["compute_" + t], STATS["xchg_" + t],
+                                      STATS["xchg_bytes_" + t] / 2**20 / max(STATS["n_" + t], 1)) for t in tags))
+                STATS.clear()
         return {"img": out[0]}
 
 
