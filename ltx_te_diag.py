@@ -1,4 +1,4 @@
-"""Text-encoder timing diagnostics, and a log of ComfyUI RAM-cache evictions.
+"""Text-encoder timing diagnostics, and ComfyUI RAM-cache eviction logging + small-entry protection.
 
 Wraps comfy.sd.CLIP.load_model and encode_from_tokens and logs, per encode: load time and encode time, bytes this
 process read from disk during each (/proc/self/io read_bytes: page-cache hits do not count), how much of the
@@ -41,21 +41,31 @@ def _loaded(patcher):
         return float("nan")
 
 
+_KEEP_BELOW = int(float(os.environ.get("LTX_CACHE_KEEP_MB", "64")) * 2**20)
+
+
 def _log_cache_evictions():
-    """ComfyUI's RAM-pressure output cache drops node outputs (text encodes, loaded VAEs) when host RAM runs low, so
-    the next prompt re-runs them. Log each eviction pass that removed something (ComfyUI logs it below INFO)."""
+    """ComfyUI's RAM-pressure output cache measures the cgroup working set (on Kaggle that includes pinned GPU-1 shard
+    copies and model file pages), sees < 3 GB free and, as a last resort, drops every node output, so the next
+    prompt re-runs its text encodes (~20-40 s each). Entries under LTX_CACHE_KEEP_MB of host RAM (conditioning,
+    loader outputs) free next to nothing, so that last-resort pass keeps them; large ones (decoded frames) still go.
+    LTX_CACHE_KEEP_MB=0 restores ComfyUI's behaviour. Logs each pass that evicts."""
     try:
         import comfy_execution.caching as caching
+        from comfy.system_memory import virtual_memory_available
     except ImportError:
         return
     orig = caching.RAMPressureCache.ram_release
 
-    def ram_release(self, target, *args, **kwargs):
-        n, ram = len(self.cache), _ram()
-        freed = orig(self, target, *args, **kwargs)
+    def ram_release(self, target, free_active=False, min_entry_size=0):
+        if free_active and min_entry_size < _KEEP_BELOW:
+            min_entry_size = _KEEP_BELOW  # ponytail: size-only rule; per-node-type protection if this is not enough
+        n, seen = len(self.cache), virtual_memory_available()
+        freed = orig(self, target, free_active=free_active, min_entry_size=min_entry_size)
         if len(self.cache) < n:
-            logger.info("[MultiGPU TE] ComfyUI RAM cache evicted %d node outputs (target %.1f GB available, had %.1f GB, free_active=%s)",
-                        n - len(self.cache), target / 2**30, ram, kwargs.get("free_active", args[0] if args else False))
+            logger.info("[MultiGPU TE] ComfyUI RAM cache evicted %d node outputs (%.2f GB) | ComfyUI sees %.1f GB available, target %.1f GB, "
+                        "free_active=%s | MemAvailable %.1f GB", n - len(self.cache), freed / 2**30, seen / 2**30, target / 2**30,
+                        free_active, _ram())
         return freed
     caching.RAMPressureCache.ram_release = ram_release
 
