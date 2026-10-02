@@ -9,7 +9,7 @@ so the replicas stay bit-identical.
 
 Shards come from the int8 convrot checkpoint (int8 splits land on multiples of the 256-wide rotation group;
 floating layers are split as fp16). block_forward mirrors BasicAVTransformerBlock.forward of ComfyUI 0.37.0
-(inference path, no training branch). Not wired into sampling yet: used by the standalone block test.
+(inference path, no training branch). UNETLoaderLTXTensorParallel plugs it into sampling.
 """
 import json
 import logging
@@ -21,8 +21,14 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+import comfy.cli_args
 import comfy.ldm.common_dit
+import comfy.model_management
+import comfy.model_prefetch
+import comfy.patcher_extension
 import comfy.quant_ops
+import comfy.sd
+import folder_paths
 import comfy_kitchen.backends.cuda as ck_cuda
 from comfy.ldm.lightricks.av_model import BasicAVTransformerBlock, CompressedTimestep
 from comfy.ldm.lightricks.model import apply_rotary_emb, apply_rotary_emb_qk
@@ -89,34 +95,69 @@ def _load_lin(f, keys, meta, name, axis, rank):
     return Lin(w.contiguous(), s, b, w.dtype == torch.int8)
 
 
+def _block_cpu(f, keys, meta, pre, rank):
+    """One rank's shard of the block at key prefix `pre`, on the CPU."""
+    sh = {"tables": {}}
+    for name in ATTNS:
+        p = pre + name + "."
+        a = {n: _load_lin(f, keys, meta, p + n, 0, rank) for n in ("to_q", "to_k", "to_v")}
+        a["to_out"] = _load_lin(f, keys, meta, p + "to_out.0", 1, rank)
+        a["gate"] = _load_lin(f, keys, meta, p + "to_gate_logits", 0, rank) if p + "to_gate_logits.weight" in keys else None
+        inner = f.get_slice(p + "to_q.weight").get_shape()[0]
+        lo, hi = rank * inner // 2, (rank + 1) * inner // 2
+        a["q_norm"] = f.get_tensor(p + "q_norm.weight").half()[lo:hi].contiguous()
+        a["k_norm"] = f.get_tensor(p + "k_norm.weight").half()[lo:hi].contiguous()
+        a["inner"] = inner
+        sh[name] = a
+    for name in FFS:
+        p = pre + name + ".net."
+        sh[name] = {"proj": _load_lin(f, keys, meta, p + "0.proj", 0, rank), "out": _load_lin(f, keys, meta, p + "2", 1, rank)}
+    for t in TABLES:
+        if pre + t in keys:
+            sh["tables"][t] = f.get_tensor(pre + t).half()
+    return sh
+
+
+def _open(path):
+    f = safe_open(path, framework="pt", device="cpu")
+    return f, set(f.keys()), json.loads((f.metadata() or {}).get("_quantization_metadata", "{}")).get("layers", {})
+
+
 def load_block_shards(path, i):
     """[rank-0 shard, rank-1 shard] of transformer block i, on DEVICES[0] / DEVICES[1]."""
-    with safe_open(path, framework="pt", device="cpu") as f:
-        keys = set(f.keys())
-        meta = json.loads((f.metadata() or {}).get("_quantization_metadata", "{}")).get("layers", {})
-        pre = _block_prefix(f) + "%d." % i
-        shards = []
-        for rank, dev in enumerate(DEVICES):
-            sh = {"tables": {}}
-            for name in ATTNS:
-                p = pre + name + "."
-                a = {n: _load_lin(f, keys, meta, p + n, 0, rank) for n in ("to_q", "to_k", "to_v")}
-                a["to_out"] = _load_lin(f, keys, meta, p + "to_out.0", 1, rank)
-                a["gate"] = _load_lin(f, keys, meta, p + "to_gate_logits", 0, rank) if p + "to_gate_logits.weight" in keys else None
-                inner = f.get_slice(p + "to_q.weight").get_shape()[0]
-                lo, hi = rank * inner // 2, (rank + 1) * inner // 2
-                a["q_norm"] = f.get_tensor(p + "q_norm.weight").half()[lo:hi].contiguous()
-                a["k_norm"] = f.get_tensor(p + "k_norm.weight").half()[lo:hi].contiguous()
-                a["inner"] = inner
-                sh[name] = a
-            for name in FFS:
-                p = pre + name + ".net."
-                sh[name] = {"proj": _load_lin(f, keys, meta, p + "0.proj", 0, rank), "out": _load_lin(f, keys, meta, p + "2", 1, rank)}
-            for t in TABLES:
-                if pre + t in keys:
-                    sh["tables"][t] = f.get_tensor(pre + t).half()
-            shards.append(_to(sh, dev))
-    return shards
+    f, keys, meta = _open(path)
+    pre = _block_prefix(f) + "%d." % i
+    return [_to(_block_cpu(f, keys, meta, pre, rank), dev) for rank, dev in enumerate(DEVICES)]
+
+
+def load_all_shards(path, n_blocks, pin_rank1=True):
+    """GPU shards [rank][block] for all blocks, plus the rank-1 shards as (pinned) host copies [block], which
+    let GPU 1 give its memory back (VAE decode, text encoder) and get the shards back without reading the file."""
+    f, keys, meta = _open(path)
+    prefix = _block_prefix(f)
+    gpu, host = [[], []], []
+    t0 = time.perf_counter()
+    for i in range(n_blocks):
+        pre = prefix + "%d." % i
+        gpu[0].append(_to(_block_cpu(f, keys, meta, pre, 0), DEVICES[0]))
+        h = _block_cpu(f, keys, meta, pre, 1)
+        if pin_rank1:
+            h = _pin(h)
+        host.append(h)
+        gpu[1].append(_to(h, DEVICES[1]))
+        if i % 12 == 0:
+            logger.info("[MultiGPU LTX TP] sharded block %d/%d (%.0fs)", i, n_blocks, time.perf_counter() - t0)
+    return gpu, host
+
+
+def _pin(obj):
+    if torch.is_tensor(obj):
+        return obj.pin_memory()
+    if isinstance(obj, Lin):
+        return Lin(*(_pin(getattr(obj, k)) for k in ("w", "s", "b")), obj.int8)
+    if isinstance(obj, dict):
+        return {k: _pin(v) for k, v in obj.items()}
+    return obj
 
 
 def _to(obj, dev):
@@ -443,3 +484,181 @@ def slice_pe(pe, rank):
 
 def replicate(obj, dev):
     return _to(obj, dev)
+
+
+# ----------------------------------------------------------------------------------------------- sampling integration
+
+_KW = ("v_context", "a_context", "attention_mask", "v_timestep", "a_timestep", "v_pe", "a_pe", "v_cross_pe", "a_cross_pe",
+       "v_cross_scale_shift_timestep", "a_cross_scale_shift_timestep", "v_cross_gate_timestep", "a_cross_gate_timestep",
+       "self_attention_mask", "v_prompt_timestep", "a_prompt_timestep")
+_PE = ("v_pe", "a_pe", "v_cross_pe", "a_cross_pe")
+_INSTANCES = {}
+
+
+def _gpu_free():
+    return " ".join("cuda:%d %.1f/%.1f GB free" % ((d.index,) + tuple(v / 2**30 for v in torch.cuda.mem_get_info(d))) for d in DEVICES)
+
+
+class LTXTensorParallel:
+    """Runs every LTX AV transformer block on both GPUs. Shards are built from the checkpoint on the first sampling
+    run (the model's own block weights are never paged in) and stay resident; GPU 1's half also has a pinned host
+    copy, so park() frees GPU 1 instantly (before a VAE decode) and unpark() restores it over PCIe."""
+
+    def __init__(self, path, dm):
+        self.path = path
+        self.blocks = dm.transformer_blocks
+        self.cadaln = bool(getattr(self.blocks[0], "cross_attention_adaln", False))
+        set_heads(self.blocks[0].attn1.heads, self.blocks[0].audio_attn1.heads)
+        self.gpu = None   # [rank][block]
+        self.host = None  # rank-1 host copies [block]
+        self.parked = False
+        self.state = None
+        self.checked = os.environ.get("LTX_TP_CHECK", "1") == "0"
+        self.fallback_logged = False
+
+    def _load(self):
+        need = int(sum(p.numel() * p.element_size() for p in self.blocks.parameters()) / 2 * 1.05)
+        for d in DEVICES:
+            comfy.model_management.free_memory(need + (1 << 30), d)
+        t0 = time.perf_counter()
+        self.gpu, self.host = load_all_shards(self.path, len(self.blocks))
+        logger.info("[MultiGPU LTX TP] %d blocks sharded in %.0fs: %.2f / %.2f GB on %s / %s | %s", len(self.blocks),
+                    time.perf_counter() - t0, sum(map(shard_bytes, self.gpu[0])) / 2**30,
+                    sum(map(shard_bytes, self.gpu[1])) / 2**30, DEVICES[0], DEVICES[1], _gpu_free())
+
+    def park(self):
+        """Drop GPU 1's shards (host copies kept) so another model can use GPU 1."""
+        if self.gpu is None or self.parked:
+            return
+        torch.cuda.synchronize(DEVICES[1])
+        self.gpu[1] = None
+        self.state = None
+        XCHG.bufs.clear()
+        with torch.cuda.device(DEVICES[1]):
+            torch.cuda.empty_cache()
+        self.parked = True
+        logger.info("[MultiGPU LTX TP] parked GPU 1 shards: %s", _gpu_free())
+
+    def unpark(self):
+        if not self.parked:
+            return
+        need = sum(map(shard_bytes, self.host))
+        comfy.model_management.free_memory(need + (1 << 30), DEVICES[1])
+        t0 = time.perf_counter()
+        with torch.cuda.device(DEVICES[1]):
+            self.gpu[1] = [_to(h, DEVICES[1]) for h in self.host]
+            torch.cuda.synchronize(DEVICES[1])
+        self.parked = False
+        logger.info("[MultiGPU LTX TP] restored %.2f GB of GPU 1 shards in %.1fs: %s", need / 2**30, time.perf_counter() - t0, _gpu_free())
+
+    def _inputs(self, i, args):
+        """Per-rank copies of the block inputs, built at block 0 of every forward (the same for all its blocks)."""
+        if i != 0 and self.state is not None:
+            return self.state
+        kws = []
+        for r, dev in enumerate(DEVICES):
+            with torch.cuda.device(dev):
+                kw = {}
+                for k in _KW:
+                    v = args.get(k)
+                    if k in _PE:
+                        v = slice_pe(v, r)
+                    kw[k] = v if r == 0 else _to(v, dev)
+                kws.append(kw)
+        self.state = {"kw": {k: [kws[0][k], kws[1][k]] for k in _KW}, "x0": None, "x1": None}
+        return self.state
+
+    def block(self, i, args, original):
+        if self.gpu is None:
+            with comfy.model_prefetch.pause_malloc_graph(sync=True):
+                self._load()
+        self.unpark()
+        st = self._inputs(i, args)
+        vx, ax = args["img"]
+        if st["x0"] is not None and st["x0"][0] is vx and st["x0"][1] is ax:
+            x1 = st["x1"]
+        else:
+            with torch.cuda.device(DEVICES[1]):
+                x1 = (vx.to(DEVICES[1]), ax.to(DEVICES[1]))
+        ref = None
+        if not self.checked:
+            ref = original({**args, "img": (vx.clone(), ax.clone())})["img"]
+        topts = args["transformer_options"]
+        try:
+            out = block_forward([self.gpu[0][i], self.gpu[1][i]], [(vx, ax), x1], self.cadaln,
+                                transformer_options=[topts, topts], **st["kw"])
+        except NotImplementedError as e:
+            if not self.fallback_logged:
+                logger.warning("[MultiGPU LTX TP] %s: block %d runs on one GPU", e, i)
+                self.fallback_logged = True
+            st["x0"] = None
+            return original(args)
+        if ref is not None:
+            self.checked = True
+            for s, name in ((0, "video"), (1, "audio")):
+                rel = float((out[0][s].float() - ref[s].float()).norm() / ref[s].float().norm().clamp_min(1e-20))
+                drift = float((out[0][s].float() - out[1][s].float().to(DEVICES[0])).abs().max())
+                logger.info("[MultiGPU LTX TP] block %d check, %s: rel err vs one GPU %.2e, replica drift %.2e", i, name, rel, drift)
+        st["x0"], st["x1"] = out[0], out[1]
+        return {"img": out[0]}
+
+
+def park_for(device):
+    """Called before a large decode on `device`: free the tensor-parallel shards there."""
+    if torch.device(device) == DEVICES[1]:
+        for tp in _INSTANCES.values():
+            tp.park()
+
+
+def _no_block_prefetch(executor, *args, **kwargs):
+    # the model's own block weights are unused; prefetching would page all of them in every step
+    topts = kwargs.get("transformer_options", args[3] if len(args) > 3 else None)
+    if topts is not None:
+        topts["prefetch_dynamic_vbars"] = False
+    return executor(*args, **kwargs)
+
+
+def _sampling(tp, executor, *args, **kwargs):
+    patched = [k for k in getattr(executor.class_obj.model_patcher, "patches", {}) if ".transformer_blocks." in k]
+    if patched:
+        logger.warning("[MultiGPU LTX TP] %d LoRA/patch keys on transformer blocks are NOT applied under tensor parallel "
+                       "(e.g. %s)", len(patched), patched[0])
+    t0 = time.perf_counter()
+    try:
+        return executor(*args, **kwargs)
+    finally:
+        tp.state = None
+        logger.info("[MultiGPU LTX TP] sampling run %.1fs | %s", time.perf_counter() - t0, _gpu_free())
+
+
+class UNETLoaderLTXTensorParallel:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"unet_name": (folder_paths.get_filename_list("diffusion_models"),)}}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "multigpu"
+
+    def load(self, unet_name):
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError("LTX tensor parallel needs two CUDA devices")
+        path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+        model = comfy.sd.load_diffusion_model(path)
+        dm = model.model.diffusion_model
+        if not hasattr(dm, "transformer_blocks") or not isinstance(dm.transformer_blocks[0], BasicAVTransformerBlock):
+            raise ValueError("UNETLoaderLTXTensorParallel only supports LTX 2.x audio-video checkpoints")
+        # the Comfy compiler records one device's allocations per forward; TP allocates on two
+        comfy.cli_args.args.disable_comfy_compiler = True
+        tp = _INSTANCES.get(path)
+        if tp is None:
+            tp = _INSTANCES[path] = LTXTensorParallel(path, dm)
+        else:
+            tp.blocks = dm.transformer_blocks  # shards stay; everything they need comes from the checkpoint
+        for i in range(len(dm.transformer_blocks)):
+            model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
+                                          "dit", "double_block", i)
+        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "ltx_tp", _no_block_prefetch)
+        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "ltx_tp",
+                                   lambda executor, *a, **k: _sampling(tp, executor, *a, **k))
+        return (model,)

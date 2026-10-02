@@ -38,6 +38,11 @@ import comfy_kitchen.backends.eager.na as ckna
 
 logger = logging.getLogger("MultiGPU")
 
+try:
+    from . import ltx_tensor_parallel as _tp
+except ImportError:  # loaded standalone (tests)
+    _tp = None
+
 FORCE_CHUNK_FRAMES = None  # tests: fixed chunk length instead of the free-VRAM fit
 FORCE_DUAL = False         # tests: split frames over both GPUs even when the clip fits
 DUAL = os.environ.get("LTX_VAE_DUAL", "0") == "1"
@@ -499,6 +504,8 @@ def _dual_decode(orig):
             device = torch.device(self.device)
             parked = []
             if voxels > MIN_VOXELS and device.type == "cuda":
+                if _tp is not None:
+                    _tp.park_for(device)  # tensor-parallel DiT shards on the VAE's GPU (host copies kept)
                 _free_vae_gpu(device, _decode_need(voxels))
                 parked = _park_dit(device, _decode_need(voxels))
             try:

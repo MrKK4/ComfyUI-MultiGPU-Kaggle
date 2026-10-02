@@ -21,6 +21,7 @@ from .h3_ref_cache import patch_minimax_h3_ref_cache
 from .sam3_profile import patch_sam3_profile
 from .ltx_vae_lowmem import patch_ltx_vae_lowmem
 from .ltx_block_capture import install_block_capture
+from .ltx_tensor_parallel import UNETLoaderLTXTensorParallel
 from .h3_tensor_parallel import UNETLoaderH3TensorParallel
 from .h3_dual_vae import VAEDecodeH3DualGPU, VAEEncodeH3DualGPU
 from .ltx_dual_vae import VAEDecodeLTXDualGPU
@@ -831,6 +832,7 @@ NODE_CLASS_MAPPINGS["UNETLoaderH3TensorParallel"] = UNETLoaderH3TensorParallel
 NODE_CLASS_MAPPINGS["VAEDecodeH3DualGPU"] = VAEDecodeH3DualGPU
 NODE_CLASS_MAPPINGS["VAEEncodeH3DualGPU"] = VAEEncodeH3DualGPU
 NODE_CLASS_MAPPINGS["VAEDecodeLTXDualGPU"] = VAEDecodeLTXDualGPU
+NODE_CLASS_MAPPINGS["UNETLoaderLTXTensorParallel"] = UNETLoaderLTXTensorParallel
 
 for item in registration_data:
     logger.info(fmt_reg.format(item['name'], item['found'], str(item['count'])))
