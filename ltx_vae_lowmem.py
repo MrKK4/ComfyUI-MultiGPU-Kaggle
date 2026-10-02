@@ -24,6 +24,8 @@ LTX_VAE_DUAL_MIN_VOXELS latent voxels, every model is unloaded from both GPUs.
 import logging
 import os
 import threading
+import time
+import traceback
 
 import torch
 import torch.nn.functional as F
@@ -364,6 +366,8 @@ def _forward_diff_step(self, context, x_t, t):
 def forward(self, x, pre=None, add_to=None):
     batch, t, h, w, _ = x.shape
     tc = _chunk_frames(self, x)
+    _LAST_NA.update(shape=tuple(x.shape[:4]), dim=x.shape[-1], kernel=tuple(self.kernel_size), tc=min(tc, t),
+                    free_gb=round(comfy.model_management.get_free_memory(x.device) / 2**30, 2))
     helper = _helper_device(x.device)
     if tc >= t and not FORCE_DUAL:
         return _orig_forward(self, x, pre, add_to)
@@ -519,12 +523,46 @@ def _dual_decode(orig):
     return run
 
 
+_LAST_NA = {}
+
+
+def _vae_core_decode(orig):
+    """CausalDiffusionVAE.decode with diagnostics: ComfyUI catches an out-of-memory error here and silently
+    retries with tiled decoding, so log where it ran out (call stack, last attention layer and chunk, memory
+    per GPU) before re-raising; on success log the time and peak memory."""
+    def run(self, x):
+        dev = x.device
+        if dev.type != "cuda":
+            return orig(self, x)
+        _LAST_NA.clear()
+        torch.cuda.reset_peak_memory_stats(dev)
+        start, t0 = torch.cuda.memory_allocated(dev), time.perf_counter()
+        try:
+            out = orig(self, x)
+        except torch.OutOfMemoryError as e:
+            frames = traceback.extract_tb(e.__traceback__)[-6:]
+            where = " <- ".join("%s:%d %s" % (f.filename.rsplit("/", 1)[-1], f.lineno, f.name) for f in reversed(frames))
+            logger.warning("[MultiGPU] LTX VAE OOM in decode of latent %s after %.1fs: %s | last attention %s | peak %.2f GB "
+                           "above start (%.2f GB) | %s | torch %.2f/%.2f GB alloc/reserved | at: %s",
+                           tuple(x.shape), time.perf_counter() - t0, str(e).splitlines()[0][:160], _LAST_NA or "-",
+                           (torch.cuda.max_memory_allocated(dev) - start) / 2**30, start / 2**30, _gpu_free(),
+                           torch.cuda.memory_allocated(dev) / 2**30, torch.cuda.memory_reserved(dev) / 2**30, where)
+            raise
+        torch.cuda.synchronize(dev)
+        logger.info("[MultiGPU] LTX VAE decode OK: latent %s in %.1fs, peak %.2f GB above start (%.2f GB) on %s",
+                    tuple(x.shape), time.perf_counter() - t0, (torch.cuda.max_memory_allocated(dev) - start) / 2**30,
+                    start / 2**30, dev)
+        return out
+    return run
+
+
 def patch_ltx_vae_lowmem():
     if getattr(nd.NeighborhoodAttention3D.forward, "_mgpu_lowmem", False):
         return
     forward._mgpu_lowmem = True
     nd.NeighborhoodAttention3D.forward = forward
     nd.NADiffusionDecoder.forward_diff_step = _forward_diff_step
+    nd.CausalDiffusionVAE.decode = _vae_core_decode(nd.CausalDiffusionVAE.decode)
     comfy.sd.VAE.decode = _dual_decode(comfy.sd.VAE.decode)
     comfy.sd.VAE.decode_tiled = _dual_decode(comfy.sd.VAE.decode_tiled)
     logger.info("[MultiGPU] LTX diffusion VAE: frame-chunked neighbourhood attention when the full clip does not fit%s",
