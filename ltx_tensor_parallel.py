@@ -42,6 +42,7 @@ FFS = ("ff", "audio_ff")
 TABLES = ("scale_shift_table", "audio_scale_shift_table", "prompt_scale_shift_table", "audio_prompt_scale_shift_table",
           "scale_shift_table_a2v_ca_audio", "scale_shift_table_a2v_ca_video")
 TIMING = os.environ.get("LTX_TP_TIMING", "0") == "1"
+CHECK_MAX_TOKENS = int(os.environ.get("LTX_TP_CHECK_MAX_TOKENS", "16384"))  # block-0 check only below this (memory)
 PIN_HOST = os.environ.get("LTX_TP_PIN_HOST", "1") != "0"  # GPU 1 shard host copy pinned (fast restore) or pageable  # sync around every exchange and report where the time goes
 
 
@@ -610,6 +611,7 @@ class LTXTensorParallel:
         self.parked = False
         self.state = None
         self.checked = os.environ.get("LTX_TP_CHECK", "1") == "0"
+        self.check_skip_logged = False
         self.fallback_logged = False
         # activation peak per video token, max over forwards (measured; the default is a guess for the first one)
         self.act_per_tok = float(os.environ.get("LTX_TP_ACT_MB_PER_KTOK", "160")) * 2**20 / 1000
@@ -730,7 +732,21 @@ class LTXTensorParallel:
                 x1 = (vx.to(DEVICES[1]), ax.to(DEVICES[1]))
         ref = None
         if not self.checked:
-            ref = original({**args, "img": (vx.clone(), ax.clone())})["img"]
+            # one-GPU reference of this block on cuda:0, next to the shards: only on a small forward (T2V stage 1 is 8k
+            # tokens; an upscale's first forward is already 32k and ran cuda:0 out of memory). Never fails the job.
+            if vx.shape[1] > CHECK_MAX_TOKENS:
+                if not self.check_skip_logged:
+                    self.check_skip_logged = True
+                    logger.info("[MultiGPU LTX TP] block %d check skipped: %d video tokens (> %d; checked on a smaller run)",
+                                i, vx.shape[1], CHECK_MAX_TOKENS)
+            else:
+                try:
+                    ref = original({**args, "img": (vx.clone(), ax.clone())})["img"]
+                except torch.OutOfMemoryError:
+                    ref = None
+                    self.checked = True
+                    torch.cuda.empty_cache()
+                    logger.warning("[MultiGPU LTX TP] block %d check skipped: out of memory on %s | %s", i, DEVICES[0], _gpu_free())
         topts = args["transformer_options"]
         try:
             out = block_forward([self.gpu[0][i], self.gpu[1][i]], [(vx, ax), x1], self.cadaln,
