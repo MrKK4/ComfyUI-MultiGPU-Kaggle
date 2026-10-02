@@ -772,9 +772,36 @@ def _dual_tiled_3d(orig):
     return run
 
 
+ENCODE_FP32 = os.environ.get("LTX_VAE_ENCODE_FP32", "1") == "1"
+
+
+def _encode_fp32(orig):
+    """CausalDiffusionVAE.encode with the encoder in fp32. --fp16-vae is a 2.9x win for the diffusion decoder, but the
+    conv encoder overflows in fp16 and returns an all-NaN latent (upscale / image-to-video came out black). The encoder
+    weights are cast for the call and back; the encode is seconds per job. A non-finite latent raises instead of
+    silently making a black video. LTX_VAE_ENCODE_FP32=0 keeps the old behaviour."""
+    def run(self, x, *args, **kwargs):
+        dtype = next(self.encoder.parameters()).dtype
+        if ENCODE_FP32 and dtype in (torch.float16, torch.bfloat16):
+            self.encoder.float()
+            try:
+                out = orig(self, x.float(), *args, **kwargs).to(dtype)
+            finally:
+                self.encoder.to(dtype)
+        else:
+            out = orig(self, x, *args, **kwargs)
+        if not torch.isfinite(out).all():
+            raise RuntimeError("LTX VAE encode produced NaN/inf (%.1f%% of the latent; encoder dtype %s). Set "
+                               "LTX_VAE_ENCODE_FP32=1 or drop --fp16-vae." % (100 * (~torch.isfinite(out)).float().mean().item(),
+                                                                             torch.float32 if ENCODE_FP32 else dtype))
+        return out
+    return run
+
+
 def patch_ltx_vae_lowmem():
     if getattr(nd.NeighborhoodAttention3D.forward, "_mgpu_lowmem", False):
         return
+    nd.CausalDiffusionVAE.encode = _encode_fp32(nd.CausalDiffusionVAE.encode)
     forward._mgpu_lowmem = True
     nd.NeighborhoodAttention3D.forward = forward
     nd.NADiffusionDecoder.forward_diff_step = _forward_diff_step
