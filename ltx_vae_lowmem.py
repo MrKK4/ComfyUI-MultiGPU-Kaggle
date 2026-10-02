@@ -403,6 +403,34 @@ def _park_dit(device, need):
     return parked
 
 
+def _models_on_gpus():
+    rows = []
+    for lm in comfy.model_management.current_loaded_models:
+        try:
+            mp = lm.model
+            rows.append("%s@%s%s %.1f GB loaded" % (type(getattr(mp, "model", mp)).__name__, lm.device,
+                                                   " dynamic" if mp.is_dynamic() else "", mp.loaded_size() / 2**30))
+        except Exception as e:  # dead weakref etc.
+            rows.append("? (%s)" % type(e).__name__)
+    torch_gb = " ".join("cuda:%d torch %.1f/%.1f GB alloc/reserved" % (
+        d, torch.cuda.memory_allocated(d) / 2**30, torch.cuda.memory_reserved(d) / 2**30) for d in range(torch.cuda.device_count()))
+    return "; ".join(rows) + " | " + torch_gb
+
+
+def _free_vae_gpu(device, need):
+    """Dynamic VRAM skips dynamic models when another dynamic model (the VAE) loads, so a text encoder staged on
+    the VAE's GPU stays there; the decode's own activations cannot evict it. Free the VAE's GPU explicitly
+    (non-dynamic free: only models loaded on this device, e.g. the text encoder; the DiT lives on another)."""
+    if torch.cuda.mem_get_info(device)[0] >= need:
+        return
+    unloaded = comfy.model_management.free_memory(need, device)
+    comfy.model_management.soft_empty_cache()
+    logger.info("[MultiGPU] LTX VAE decode: freed %s for a %.1f GB decode, unloaded %d model(s): %s; now %s",
+                device, need / 2**30, len(unloaded),
+                ", ".join(type(getattr(m.model, "model", m.model)).__name__ for m in unloaded if m.model is not None) or "-",
+                _gpu_free())
+
+
 def _unpark(parked):
     if not parked:
         return
@@ -422,10 +450,14 @@ def _dual_decode(orig):
         voxels = samples.shape[-3] * samples.shape[-2] * samples.shape[-1]
         helper = _helper_device(torch.device(self.device)) if DUAL else None
         if voxels > MIN_VOXELS:
-            logger.info("[MultiGPU] LTX VAE decode (%d latent voxels) on %s: %s", voxels, self.device, _gpu_free())
+            logger.info("[MultiGPU] LTX VAE decode (%d latent voxels) on %s: %s | models: %s", voxels, self.device,
+                        _gpu_free(), _models_on_gpus())
         if helper is None:
             device = torch.device(self.device)
-            parked = _park_dit(device, _decode_need(voxels)) if voxels > MIN_VOXELS and device.type == "cuda" else []
+            parked = []
+            if voxels > MIN_VOXELS and device.type == "cuda":
+                _free_vae_gpu(device, _decode_need(voxels))
+                parked = _park_dit(device, _decode_need(voxels))
             try:
                 return orig(self, samples, *args, **kwargs)
             finally:
