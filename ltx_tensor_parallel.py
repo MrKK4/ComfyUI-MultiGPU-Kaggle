@@ -161,12 +161,21 @@ def _ev(dev):
     return e
 
 
+CHUNKS = max(1, int(os.environ.get("LTX_TP_CHUNKS", "4")))
+_CHUNK_MIN_BYTES = 16 << 20  # tensors below this go in one piece
+
+
 class Exchange:
-    """Sum of two per-rank tensors through pinned host buffers (no P2P). Buffers persist per (tag, shape,
-    dtype); an event per buffer guards its reuse until the other rank's host-to-device copy has read it."""
+    """Sum of two per-rank tensors (B, T, ...) through pinned host buffers (no P2P), in token chunks on two side
+    streams per GPU: one copies chunks out to the host, the other copies the other rank's chunks back in, so the
+    two PCIe directions overlap (chunk j comes in while chunk j+1 goes out) and each landed chunk is added on the
+    compute stream. The sum is done in place in parts[r] (rank 0: p0 += p1, rank 1: p1 += p0, the same values).
+    Host buffers persist per (tag, shape, dtype, chunks); per-chunk events guard their reuse until the other rank
+    has read them. No side-stream allocations: the receive buffer is allocated on the compute stream."""
 
     def __init__(self):
         self.bufs = {}
+        self.streams = None
 
     def allreduce(self, parts, tag):
         t0 = time.perf_counter() if TIMING else None
@@ -174,26 +183,46 @@ class Exchange:
             for d in DEVICES:
                 torch.cuda.synchronize(d)
             t_ready = time.perf_counter()
-        key = (tag, tuple(parts[0].shape), parts[0].dtype)
+        if self.streams is None:
+            self.streams = [(torch.cuda.Stream(d), torch.cuda.Stream(d)) for d in DEVICES]
+        shape, nbytes = tuple(parts[0].shape), parts[0].numel() * parts[0].element_size()
+        k = CHUNKS if nbytes >= _CHUNK_MIN_BYTES and shape[1] >= CHUNKS else 1
+        bounds = [(shape[1] * j // k, shape[1] * (j + 1) // k) for j in range(k)]
+        key = (tag, shape, parts[0].dtype, k)
         buf = self.bufs.get(key)
         if buf is None:
-            buf = self.bufs[key] = {"host": [torch.empty(parts[0].shape, dtype=parts[0].dtype, pin_memory=True) for _ in DEVICES],
-                                    "read": [None, None]}
-        sent = []
+            buf = self.bufs[key] = {"host": [torch.empty(shape, dtype=parts[0].dtype, pin_memory=True) for _ in DEVICES],
+                                    "read": [None, None]}  # read[r][j]: rank r finished copying host[1-r] chunk j
+        sent = [[None] * k for _ in DEVICES]
         for r, dev in enumerate(DEVICES):
             with torch.cuda.device(dev):
-                s = torch.cuda.current_stream(dev)
-                if buf["read"][1 - r] is not None:  # the other rank finished reading host[r] last time
-                    s.wait_event(buf["read"][1 - r])
-                buf["host"][r].copy_(parts[r], non_blocking=True)
-                sent.append(_ev(dev))
-        out = []
+                d2h = self.streams[r][0]
+                d2h.wait_event(_ev(dev))  # parts[r] computed
+                for j, (a, b) in enumerate(bounds):
+                    if buf["read"][1 - r] is not None:
+                        d2h.wait_event(buf["read"][1 - r][j])
+                    with torch.cuda.stream(d2h):
+                        buf["host"][r][:, a:b].copy_(parts[r][:, a:b], non_blocking=True)
+                    sent[r][j] = torch.cuda.Event()
+                    sent[r][j].record(d2h)
         for r, dev in enumerate(DEVICES):
             with torch.cuda.device(dev):
-                torch.cuda.current_stream(dev).wait_event(sent[1 - r])
-                other = buf["host"][1 - r].to(dev, non_blocking=True)
-                buf["read"][r] = _ev(dev)
-                out.append(parts[r] + other)
+                comp, h2d = torch.cuda.current_stream(dev), self.streams[r][1]
+                recv = torch.empty_like(parts[r])
+                h2d.wait_event(_ev(dev))  # recv allocated
+                reads = []
+                for j, (a, b) in enumerate(bounds):
+                    h2d.wait_event(sent[1 - r][j])
+                    with torch.cuda.stream(h2d):
+                        recv[:, a:b].copy_(buf["host"][1 - r][:, a:b], non_blocking=True)
+                    ev = torch.cuda.Event()
+                    ev.record(h2d)
+                    reads.append(ev)
+                    comp.wait_event(ev)
+                    comp.wait_event(sent[r][j])  # own chunk j is on the host before it is overwritten
+                    parts[r][:, a:b] += recv[:, a:b]
+                buf["read"][r] = reads
+        out = parts
         if TIMING:
             for d in DEVICES:
                 torch.cuda.synchronize(d)
