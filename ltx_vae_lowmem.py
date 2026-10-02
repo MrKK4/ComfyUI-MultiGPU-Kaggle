@@ -51,11 +51,14 @@ _HELPER_WEIGHTS = {}
 _orig_forward = nd.NeighborhoodAttention3D.forward
 
 
+_STACK_BUDGET = 2 ** 26  # elements of stacked K/V per batched SDPA call (comfy_kitchen eager uses 2**28)
+
+
 def _fit(free, frame, halo):
-    # per chunk of tc frames, over tc + 2*halo frames: pre(x), qkv output (3) and the fp32 RoPE matrices
-    # (512 B per token at head_dim 64 = one fp16 frame at dim 256); over tc frames: the na3d output and the
-    # pending projection
-    return int((free / frame - 5 * 2 * halo) // 7)
+    # per chunk of tc frames: k, v over tc + 2*halo frames; q, the na3d output and the pending projection over tc;
+    # one frame each of pre(x), the q/k/v projection and the RoPE matrices; the stacked K/V tiles of one SDPA call
+    free -= 6 * _STACK_BUDGET
+    return int((free / frame - 4 * halo - 4) // 5)
 
 
 def _chunk_frames(self, x):
@@ -132,7 +135,7 @@ def _na3d_rows(q, k, v, kernel_size, t_total, q0, k0):
     for rel, tiles in groups.items():
         mask = ckna._group_mask(rel, q.dtype, q.device)
         nq, nk = mask.shape[2], mask.shape[3]
-        g_max = max(1, ckna.NA_KV_STACK_BUDGET // max(1, batch * nh * nk * hd * 2))
+        g_max = max(1, min(ckna.NA_KV_STACK_BUDGET, _STACK_BUDGET) // max(1, batch * nh * nk * hd * 2))
         qs0, _ = tiles[0]
         tt, th, tw = (qs0[0].stop - qs0[0].start, qs0[1].stop - qs0[1].start, qs0[2].stop - qs0[2].start)
         for c0 in range(0, len(tiles), g_max):
@@ -152,17 +155,35 @@ def _na3d_rows(q, k, v, kernel_size, t_total, q0, k0):
     return out
 
 
-def _attend(self, sl, a, b, t0, t1, t_total, tables, q_weight, k_weight, qkv, proj):
-    batch, _, h, w, _ = sl.shape
-    cshape = (batch, b - a, h, w, self.num_heads, self.head_dim)
-    q, k, v = (c.reshape(cshape) for c in qkv(sl).chunk(3, dim=-1))
-    freqs = nd._rope_matrices_slice(tables, a, b, h, w)
-    nt = (b - a) * h * w
-    for bi in range(batch):
-        comfy_kitchen.rms_rope_(q[bi].view(1, nt, self.num_heads, self.head_dim),
-                                k[bi].view(1, nt, self.num_heads, self.head_dim), freqs, q_weight, k_weight)
-    del freqs
-    out = _na3d_rows(q[:, t0 - a:t1 - a], k, v, list(self.kernel_size), t_total, t0, a)
+def _attend(self, src, a, b, t0, t1, t_total, tables, q_weight, k_weight, qkv_w, qkv_b, proj):
+    """Attention output for frames [t0, t1), reading frames [a, b) through src(f0, f1) (pre-applied input).
+
+    Projects and rotates one frame at a time straight into q (own frames only), k and v (own frames + halo),
+    so no fused qkv output, full-chunk input copy or chunk-wide RoPE matrices are ever allocated."""
+    dim, nh, hd = self.dim, self.num_heads, self.head_dim
+    wq, wk, wv = qkv_w[:dim], qkv_w[dim:2 * dim], qkv_w[2 * dim:]
+    bq, bk, bv = (None, None, None) if qkv_b is None else (qkv_b[:dim], qkv_b[dim:2 * dim], qkv_b[2 * dim:])
+    q = k = v = None
+    for f in range(a, b):
+        sl = src(f, f + 1)
+        if k is None:
+            batch, _, h, w, _ = sl.shape
+            k = torch.empty((batch, b - a, h, w, nh, hd), dtype=sl.dtype, device=sl.device)
+            v = torch.empty_like(k)
+            q = torch.empty((batch, t1 - t0, h, w, nh, hd), dtype=sl.dtype, device=sl.device)
+            nt = h * w
+        qf = F.linear(sl, wq, bq).view(batch, h, w, nh, hd)
+        k[:, f - a] = F.linear(sl, wk, bk).view(batch, h, w, nh, hd)
+        v[:, f - a] = F.linear(sl, wv, bv).view(batch, h, w, nh, hd)
+        del sl
+        freqs = nd._rope_matrices_slice(tables, f, f + 1, h, w)
+        for bi in range(batch):
+            comfy_kitchen.rms_rope_(qf[bi].view(1, nt, nh, hd), k[bi, f - a].view(1, nt, nh, hd), freqs, q_weight, k_weight)
+        del freqs
+        if t0 <= f < t1:
+            q[:, f - t0] = qf
+        del qf
+    out = _na3d_rows(q, k, v, list(self.kernel_size), t_total, t0, a)
     del q, k, v
     return proj(out.reshape(batch, t1 - t0, h, w, self.dim))
 
@@ -174,9 +195,9 @@ def _norm_weights(self, dtype):
 def _run_chunks(self, x, pre, res, add, chunks, tables, q_weight, k_weight):
     pending = []
     for j, (t0, t1, a, b) in enumerate(chunks):
-        sl = x[:, a:b] if pre is None else pre(x[:, a:b])
-        pending.append((t0, t1, _attend(self, sl, a, b, t0, t1, x.shape[1], tables, q_weight, k_weight, self.qkv, self.proj)))
-        del sl
+        src = (lambda f0, f1: x[:, f0:f1]) if pre is None else (lambda f0, f1: pre(x[:, f0:f1]))
+        pending.append((t0, t1, _attend(self, src, a, b, t0, t1, x.shape[1], tables, q_weight, k_weight,
+                                        self.qkv.weight, self.qkv.bias, self.proj)))
         # in place: a result is written only once no later chunk reads those frames
         next_read = min((c[2] for c in chunks[j + 1:]), default=x.shape[1])
         while pending and pending[0][1] <= next_read:
@@ -266,8 +287,8 @@ def _dual(self, x, pre, res, add, helper, tc_p):
                 tables = nd._rope_tables((t, h, w), inv, helper)
                 pending = []
                 for j, (t0, t1, a, b) in enumerate(h_chunks):
-                    pending.append((t0, t1, _attend(self, snap[:, a - ha:b - ha], a, b, t0, t1, t, tables, q_weight, k_weight,
-                                                    lambda z: F.linear(z, qkv_w, qkv_b), lambda z: F.linear(z, proj_w, proj_b))))
+                    pending.append((t0, t1, _attend(self, lambda f0, f1: snap[:, f0 - ha:f1 - ha], a, b, t0, t1, t, tables,
+                                                    q_weight, k_weight, qkv_w, qkv_b, lambda z: F.linear(z, proj_w, proj_b))))
                     next_read = min((c[2] for c in h_chunks[j + 1:]), default=t)
                     while pending and pending[0][1] <= next_read:
                         p0, p1, py = pending.pop(0)
