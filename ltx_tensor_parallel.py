@@ -42,6 +42,9 @@ FFS = ("ff", "audio_ff")
 TABLES = ("scale_shift_table", "audio_scale_shift_table", "prompt_scale_shift_table", "audio_prompt_scale_shift_table",
           "scale_shift_table_a2v_ca_audio", "scale_shift_table_a2v_ca_video")
 TIMING = os.environ.get("LTX_TP_TIMING", "0") == "1"
+# LTX_TP_PROFILE_TOKENS=N: profile block PROFILE_BLOCK of the first forward with >= N video tokens (once per server)
+PROFILE_TOKENS = int(os.environ.get("LTX_TP_PROFILE_TOKENS", "0"))
+PROFILE_BLOCK = 5
 CHECK_MAX_TOKENS = int(os.environ.get("LTX_TP_CHECK_MAX_TOKENS", "16384"))  # block-0 check only below this (memory)
 PIN_HOST = os.environ.get("LTX_TP_PIN_HOST", "1") != "0"  # GPU 1 shard host copy pinned (fast restore) or pageable  # sync around every exchange and report where the time goes
 
@@ -612,6 +615,7 @@ class LTXTensorParallel:
         self.state = None
         self.checked = os.environ.get("LTX_TP_CHECK", "1") == "0"
         self.check_skip_logged = False
+        self.profiled = False
         self.fallback_logged = False
         # activation peak per video token, max over forwards (measured; the default is a guess for the first one)
         self.act_per_tok = float(os.environ.get("LTX_TP_ACT_MB_PER_KTOK", "160")) * 2**20 / 1000
@@ -749,8 +753,13 @@ class LTXTensorParallel:
                     logger.warning("[MultiGPU LTX TP] block %d check skipped: out of memory on %s | %s", i, DEVICES[0], _gpu_free())
         topts = args["transformer_options"]
         try:
-            out = block_forward([self.gpu[0][i], self.gpu[1][i]], [(vx, ax), x1], self.cadaln,
-                                transformer_options=[topts, topts], **st["kw"])
+            run = lambda: block_forward([self.gpu[0][i], self.gpu[1][i]], [(vx, ax), x1], self.cadaln,  # noqa: E731
+                                        transformer_options=[topts, topts], **st["kw"])
+            if PROFILE_TOKENS and not self.profiled and i == PROFILE_BLOCK and vx.shape[1] >= PROFILE_TOKENS:
+                self.profiled = True
+                out = _profile_block(run, i, vx.shape[1])
+            else:
+                out = run()
         except torch.OutOfMemoryError:
             self._oom_report(i, vx.shape[1])
             raise
@@ -785,6 +794,69 @@ class LTXTensorParallel:
                                       STATS["xchg_bytes_" + t] / 2**20 / max(STATS["n_" + t], 1)) for t in tags))
                 STATS.clear()
         return {"img": out[0]}
+
+
+def _merge(intervals):
+    out = []
+    for a, b in sorted(intervals):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def _profile_block(run, i, tokens):
+    """One block under torch.profiler: CPU time to queue it vs wall time, each GPU's busy time and how long both GPUs
+    are busy at once (they should overlap almost fully under tensor parallel), and the top CPU-side calls (a CUDA sync
+    or .item() in there serializes the GPUs). The block runs exactly once; a profiler failure only loses the report."""
+    from torch.profiler import ProfilerActivity, profile
+    for d in DEVICES:
+        torch.cuda.synchronize(d)
+    try:
+        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+        prof.__enter__()
+    except Exception as exc:
+        logger.warning("[MultiGPU LTX TP] profiler unavailable (%s), block %d runs unprofiled", exc, i)
+        return run()
+    t0 = time.perf_counter()
+    try:
+        out = run()
+        t_queue = time.perf_counter() - t0
+        for d in DEVICES:
+            torch.cuda.synchronize(d)
+        wall = time.perf_counter() - t0
+    finally:
+        prof.__exit__(None, None, None)
+    try:
+        busy = {0: [], 1: []}
+        for e in prof.events():
+            if getattr(e, "device_type", None) == torch.autograd.DeviceType.CUDA and e.device_index in busy:
+                busy[e.device_index].append((e.time_range.start, e.time_range.end))
+        m0, m1 = _merge(busy[0]), _merge(busy[1])
+        both, j = 0.0, 0
+        for a, b in m0:
+            while j < len(m1) and m1[j][1] < a:
+                j += 1
+            k = j
+            while k < len(m1) and m1[k][0] < b:
+                both += max(0.0, min(b, m1[k][1]) - max(a, m1[k][0]))
+                k += 1
+        b0, b1 = sum(b - a for a, b in m0) / 1e3, sum(b - a for a, b in m1) / 1e3
+        logger.info("[MultiGPU LTX TP] PROFILE block %d, %d video tokens: wall %.1f ms, CPU queued it in %.1f ms | GPU busy "
+                    "cuda:0 %.1f ms, cuda:1 %.1f ms, BOTH at once %.1f ms (%.0f%% of the busier GPU)", i, tokens, wall * 1e3,
+                    t_queue * 1e3, b0, b1, both / 1e3, 100 * both / 1e3 / max(b0, b1, 1e-9))
+        avg = prof.key_averages()
+        logger.info("[MultiGPU LTX TP] PROFILE top CPU-side calls:\n%s", avg.table(sort_by="self_cpu_time_total", row_limit=22, max_name_column_width=60))
+        for key in ("self_device_time_total", "self_cuda_time_total"):
+            try:
+                logger.info("[MultiGPU LTX TP] PROFILE top GPU kernels:\n%s", avg.table(sort_by=key, row_limit=14, max_name_column_width=60))
+                break
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.warning("[MultiGPU LTX TP] profile report failed: %s", exc)
+    return out
 
 
 def park_for(device):
