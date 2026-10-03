@@ -119,6 +119,8 @@ class Krea2TensorParallel:
         self.checked = os.environ.get("KREA2_TP_CHECK", "1") == "0"
         self.lora = ({}, (), [])     # (spec, key, unsupported) from the model's patches at sampling start
         self.lora_applied = ()
+        self.txt = None              # (txtfusion input, output) of this sampling run
+        self.txt_stats = [0, 0, 0.0]  # computed, reused, seconds computing
 
     def _load(self):
         need = int(sum(p.numel() * p.element_size() for p in self.blocks.parameters()) / 2 * 1.05)
@@ -224,9 +226,28 @@ def _sampling(tp, executor, *args, **kwargs):
     try:
         return executor(*args, **kwargs)
     finally:
-        tp.state = None
+        tp.state, tp.txt = None, None
         L.XCHG.bufs.clear()  # pinned exchange buffers: rebuilt next run
-        logger.info("[MultiGPU Krea2 TP] sampling run %.1fs | %s | %s", time.perf_counter() - t0, L._gpu_free(), L._ram())
+        logger.info("[MultiGPU Krea2 TP] sampling run %.1fs | text fusion computed %d (%.2fs), reused %d | %s | %s",
+                    time.perf_counter() - t0, tp.txt_stats[0], tp.txt_stats[2], tp.txt_stats[1], L._gpu_free(), L._ram())
+        tp.txt_stats = [0, 0, 0.0]
+
+
+def _txtfusion(tp, orig, x, mask=None, transformer_options={}):
+    """txtfusion depends only on the prompt, not on the step: reuse its output within a sampling run when the input is
+    bit-identical (exact; the input is re-cast every step, so it is compared by value)."""
+    c = tp.txt
+    if c is not None and c[0].shape == x.shape and c[0].device == x.device and torch.equal(c[0], x):
+        tp.txt_stats[1] += 1
+        return c[1]
+    torch.cuda.synchronize(x.device)
+    t0 = time.perf_counter()
+    out = orig(x, mask=mask, transformer_options=transformer_options)
+    torch.cuda.synchronize(x.device)
+    tp.txt_stats[0] += 1
+    tp.txt_stats[2] += time.perf_counter() - t0
+    tp.txt = (x, out)
+    return out
 
 
 class UNETLoaderKrea2TensorParallel:
@@ -253,6 +274,9 @@ class UNETLoaderKrea2TensorParallel:
         tp.blocks = dm.blocks  # shards stay; only the fallback path and the check use the model's own blocks
         for i, blk in enumerate(dm.blocks):
             blk.forward = lambda *a, i=i, **k: tp.block(i, *a, **k)
+        if os.environ.get("KREA2_TXT_CACHE", "1") != "0":
+            orig = dm.txtfusion.forward
+            dm.txtfusion.forward = lambda *a, **k: _txtfusion(tp, orig, *a, **k)
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "krea2_tp", L._no_block_prefetch)
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "krea2_tp",
                                    lambda executor, *a, **k: _sampling(tp, executor, *a, **k))
