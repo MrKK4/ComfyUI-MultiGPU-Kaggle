@@ -14,6 +14,7 @@ floating layers are split as fp16). block_forward mirrors BasicAVTransformerBloc
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict
 
@@ -52,10 +53,11 @@ PIN_HOST = os.environ.get("LTX_TP_PIN_HOST", "1") != "0"  # GPU 1 shard host cop
 # ----------------------------------------------------------------------------------------------- shards
 
 class Lin:
-    __slots__ = ("w", "s", "b", "int8")
+    __slots__ = ("w", "s", "b", "int8", "lora")
 
     def __init__(self, w, s, b, int8):
         self.w, self.s, self.b, self.int8 = w, s, b, int8
+        self.lora = None  # [(A^T, (B * scale)^T)] on this rank, set per sampling run (_apply_lora)
 
 
 def _block_prefix(f):
@@ -365,10 +367,16 @@ OVERLAP = os.environ.get("LTX_TP_OVERLAP", "1") != "0"  # produce row-parallel o
 
 def _lin(x, p, act=None):
     if p.int8:
-        return ck_cuda.int8_linear(x, p.w, p.s, bias=p.b, convrot=True, convrot_groupsize=256, input_act=act)
-    if act == "gelu_tanh":
-        x = F.gelu(x, approximate="tanh")
-    return F.linear(x, p.w, p.b)
+        y = ck_cuda.int8_linear(x, p.w, p.s, bias=p.b, convrot=True, convrot_groupsize=256, input_act=act)
+    else:
+        y = F.linear(F.gelu(x, approximate="tanh") if act == "gelu_tanh" else x, p.w, p.b)
+    if p.lora:
+        # LoRA side path on this rank's slice: column-parallel layers hold their rows of B, row-parallel layers
+        # their columns of A (the exchange then sums the halves) -> the same as W + scale * B @ A, exactly
+        xin = F.gelu(x, approximate="tanh") if act == "gelu_tanh" else x
+        for a_t, b_t in p.lora:
+            y = y + (xin @ a_t) @ b_t
+    return y
 
 
 def _ranks(fn):
@@ -621,6 +629,27 @@ class LTXTensorParallel:
         self.act_per_tok = float(os.environ.get("LTX_TP_ACT_MB_PER_KTOK", "160")) * 2**20 / 1000
         self.fwd_start = None
         self.measured = False
+        self.lora = ({}, (), [])   # (spec, key, unsupported) from the model's patches at sampling start
+        self.lora_applied = ()     # key of the LoRA set currently on the GPU shards
+
+    def _apply_lora(self):
+        spec, key, _ = self.lora
+        for rank in range(2):
+            for sh in self.gpu[rank]:
+                for entry in list(ATTNS) + list(FFS):
+                    for v in sh[entry].values():
+                        if isinstance(v, Lin):
+                            v.lora = None
+        n_bytes = 0
+        for (block, entry, sub), loras in spec.items():
+            for rank, dev in enumerate(DEVICES):
+                parts = [lora_rank_parts(a, b, scale, axis, rank, dev) for a, b, scale, axis in loras]
+                self.gpu[rank][block][entry][sub].lora = parts
+                n_bytes += sum(t.numel() * t.element_size() for pr in parts for t in pr)
+        self.lora_applied = key
+        if spec:
+            logger.info("[MultiGPU LTX TP] LoRA: %d layers in %d blocks applied as tensor-parallel side paths (%.0f MB on both GPUs) | %s",
+                        len(spec), len({b for b, _, _ in spec}), n_bytes / 2**20, _gpu_free())
 
     def _is_dit(self, lm):
         try:
@@ -673,6 +702,7 @@ class LTXTensorParallel:
             return
         torch.cuda.synchronize(DEVICES[1])
         self.gpu[1] = None
+        self.lora_applied = None  # GPU 1's side paths went with its shards
         self.state = None
         XCHG.bufs.clear()
         with torch.cuda.device(DEVICES[1]):
@@ -722,6 +752,8 @@ class LTXTensorParallel:
             with comfy.model_prefetch.pause_malloc_graph(sync=True):
                 self._load()
         self.unpark()
+        if i == 0 and self.lora_applied != self.lora[1]:
+            self._apply_lora()
         vx, ax = args["img"]
         if i == 0:
             self._make_room(vx.shape[1])
@@ -859,6 +891,57 @@ def _profile_block(run, i, tokens):
     return out
 
 
+# ----------------------------------------------------------------------------------------------- LoRA
+
+# block-relative module path -> (shard entry, sub-entry, split axis: 0 = output rows, 1 = input columns)
+_LORA_LAYERS = {}
+for _a in ATTNS:
+    for _n in ("to_q", "to_k", "to_v"):
+        _LORA_LAYERS[_a + "." + _n] = (_a, _n, 0)
+    _LORA_LAYERS[_a + ".to_gate_logits"] = (_a, "gate", 0)
+    _LORA_LAYERS[_a + ".to_out.0"] = (_a, "to_out", 1)
+for _f in FFS:
+    _LORA_LAYERS[_f + ".net.0.proj"] = (_f, "proj", 0)
+    _LORA_LAYERS[_f + ".net.2"] = (_f, "out", 1)
+
+
+def lora_spec(patches):
+    """LoRA patches ComfyUI attached to transformer-block linears (LoraLoaderModelOnly etc.) ->
+    ({(block, entry, sub): [(A, B, scale, axis)]}, change key, unsupported keys). scale = strength * alpha / rank."""
+    spec, key, unsupported = {}, [], []
+    for k, plist in patches.items():
+        m = re.search(r"transformer_blocks\.(\d+)\.(.+)\.weight$", k)
+        if not m:
+            continue
+        layer = _LORA_LAYERS.get(m.group(2))
+        for strength, adapter, strength_model, offset, function in plist:
+            w = getattr(adapter, "weights", None)
+            ok = (layer is not None and offset is None and function is None and strength_model == 1.0
+                  and type(adapter).__name__ == "LoRAAdapter" and w is not None and len(w) >= 3
+                  and all(x is None for x in w[3:]))  # no LoCon mid, DoRA or reshape
+            if not ok:
+                unsupported.append(k)
+                continue
+            up, down, alpha = w[0], w[1], w[2]
+            scale = float(strength) * (float(alpha) / down.shape[0] if alpha is not None else 1.0)
+            spec.setdefault((int(m.group(1)),) + layer[:2], []).append((down, up, scale, layer[2]))
+            key.append((k, id(adapter), float(strength)))
+    return spec, tuple(sorted(key)), unsupported
+
+
+def lora_rank_parts(a, b, scale, axis, rank, dev):
+    """This rank's (A^T, (B * scale)^T) of a LoRA on a layer split along `axis` (A: r x in, B: out x r)."""
+    if axis == 0:
+        n = b.shape[0]
+        b = b[rank * n // 2:(rank + 1) * n // 2]
+    else:
+        n = a.shape[1]
+        a = a[:, rank * n // 2:(rank + 1) * n // 2]
+    a_t = a.to(dev, torch.float16).t().contiguous()
+    b_t = (b.to(dev, torch.float32) * scale).to(torch.float16).t().contiguous()
+    return a_t, b_t
+
+
 def park_for(device):
     """Called before a large decode on `device`: free the tensor-parallel shards there."""
     if torch.device(device) == DEVICES[1]:
@@ -905,10 +988,10 @@ def _ram():
 def _sampling(tp, executor, *args, **kwargs):
     logger.info("[MultiGPU LTX TP] sampling run starts | %s | %s", _gpu_free(), _ram())
     tp.first_block_logged = False
-    patched = [k for k in getattr(executor.class_obj.model_patcher, "patches", {}) if ".transformer_blocks." in k]
-    if patched:
-        logger.warning("[MultiGPU LTX TP] %d LoRA/patch keys on transformer blocks are NOT applied under tensor parallel "
-                       "(e.g. %s)", len(patched), patched[0])
+    tp.lora = lora_spec(getattr(executor.class_obj.model_patcher, "patches", {}))
+    if tp.lora[2]:
+        logger.warning("[MultiGPU LTX TP] %d patch keys on transformer blocks are NOT applied under tensor parallel (only plain "
+                       "LoRA on the block linears is; e.g. %s)", len(tp.lora[2]), tp.lora[2][0])
     t0 = time.perf_counter()
     try:
         return executor(*args, **kwargs)
