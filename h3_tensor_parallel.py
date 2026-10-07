@@ -126,6 +126,55 @@ def _chunk_segs(segs, a, b):
     return out
 
 
+# torch.compile fuses the per-block small ops (rmsnorm + modulation + fp16 cast, and the gated residual add) into one
+# Triton kernel each; eager runs them as 4-6 memory-bound kernels per segment. Probe on T4: 15.5 -> 2.1 ms per call.
+# MMH3_TP_COMPILE=0 keeps the eager ops; any compile failure falls back to eager for the rest of the session.
+TP_COMPILE = os.environ.get("MMH3_TP_COMPILE", "1") != "0"
+
+
+def _norm_mod_eager(x, w, eps, scale, shift):
+    h = torch.nn.functional.rms_norm(x, w.shape, weight=w, eps=eps)
+    return (h * (1.0 + scale) + shift).to(torch.float16)
+
+
+def _gate_delta_eager(own, got, gate, s):
+    return (own + got).float() * s * gate
+
+
+_NORM_MOD = torch.compile(_norm_mod_eager, dynamic=True)
+_GATE_DELTA = torch.compile(_gate_delta_eager, dynamic=True)
+
+
+def _fused(compiled, eager, *args):
+    global TP_COMPILE
+    if TP_COMPILE:
+        try:
+            return compiled(*args)
+        except Exception as e:  # ponytail: one failure disables compile for the session; eager is the old exact path
+            TP_COMPILE = False
+            logger.warning("[MultiGPU TP] torch.compile of the small ops failed, using eager: %s: %s", type(e).__name__, str(e)[:300])
+    return eager(*args)
+
+
+def _norm_mod(x, w, eps, shift, scale, segs):
+    """rmsnorm(x) * (1 + scale) + shift per modulation segment, as fp16 (the int8 linear's input)."""
+    if not TP_COMPILE:
+        return h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, w, eps), shift, scale, segs).to(torch.float16)
+    out = torch.empty(x.shape, dtype=torch.float16, device=x.device)
+    for a, b, row in segs:
+        out[a:b] = _fused(_NORM_MOD, _norm_mod_eager, x[a:b], w.to(x.dtype), eps, scale[row].to(x.dtype), shift[row].to(x.dtype))
+    return out
+
+
+def _gate_add(x, gate, own, got, segs):
+    """x += (own + got) * S * gate per segment: the gated residual of a row-parallel partial sum pair, in place."""
+    if not TP_COMPILE:
+        return h3._mod_gate(x, gate, (own + got).float() * S, segs)
+    for a, b, row in segs:
+        x[a:b].add_(_fused(_GATE_DELTA, _gate_delta_eager, own[a:b], got[a:b], gate[row].to(x.dtype), S))
+    return x
+
+
 def _per_rank(fn):
     out = []
     for r, dev in enumerate(DEVICES):
@@ -287,7 +336,7 @@ class H3TensorParallel:
         return ({}, {}) if self.lora is None else (self.lora[0][i], self.lora[1][i])
 
     def _qkv(self, x, sh, shift, scale, segs, lora):
-        h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm1"], self.eps1), shift, scale, segs).to(torch.float16)
+        h = _norm_mod(x, sh["norm1"], self.eps1, shift, scale, segs)
         out = _lin(h, sh["qkv"])
         if "attn.qkv_proj" in lora:
             out += _lora(h, lora["attn.qkv_proj"])
@@ -306,7 +355,7 @@ class H3TensorParallel:
         return optimized_attention(q, k, v, heads, mask=None, skip_reshape=True, transformer_options=topts).squeeze(0)
 
     def _mlp(self, x, sh, shift, scale, segs, lora):
-        h = h3._mod_scale_shift(comfy.rmsnorm.rms_norm(x, sh["norm2"], self.eps2), shift, scale, segs).to(torch.float16)
+        h = _norm_mod(x, sh["norm2"], self.eps2, shift, scale, segs)
         a = _lin(h, sh["fc1"])
         if "mlp.fc1" in lora:
             a += _lora(h, lora["mlp.fc1"])
@@ -389,7 +438,7 @@ class H3TensorParallel:
 
             def attn_then_mlp(r):
                 xc = xs[r][a:b]
-                h3._mod_gate(xc, mods[r][2], (own_a[j][r] + got[r]).float() * S, csegs[j][r])
+                _gate_add(xc, mods[r][2], own_a[j][r], got[r], csegs[j][r])
                 own_a[j][r] = None
                 return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r], lo[r])
             own_m.append(_per_rank(attn_then_mlp))
@@ -411,7 +460,7 @@ class H3TensorParallel:
 
             def gate_then_next_qkv(r):
                 xc = xs[r][a:b]
-                h3._mod_gate(xc, mods[r][5], (own_m[j][r] + got[r]).float() * S, csegs[j][r])
+                _gate_add(xc, mods[r][5], own_m[j][r], got[r], csegs[j][r])
                 if nxt is not None:
                     nqkv[r][a:b] = self._qkv(xc, nsh[r], nmods[r][0], nmods[r][1], csegs[j][r], nlo[r])
             _per_rank(gate_then_next_qkv)
