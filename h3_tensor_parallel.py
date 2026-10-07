@@ -150,6 +150,8 @@ def _fused(compiled, eager, *args):
     if TP_COMPILE:
         try:
             return compiled(*args)
+        except torch.OutOfMemoryError:
+            raise  # a real OOM, not a compile problem: let ComfyUI's OOM handling see it, keep compile on
         except Exception as e:  # ponytail: one failure disables compile for the session; eager is the old exact path
             TP_COMPILE = False
             logger.warning("[MultiGPU TP] torch.compile of the small ops failed, using eager: %s: %s", type(e).__name__, str(e)[:300])
