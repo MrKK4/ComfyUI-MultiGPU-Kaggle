@@ -177,6 +177,42 @@ def _gate_add(x, gate, own, got, segs):
     return x
 
 
+MEMDUMP = os.environ.get("MMH3_TP_MEMDUMP", "0") != "0"
+
+
+def _memdump(shape):
+    """MMH3_TP_MEMDUMP=1: at block 0 of every forward, what holds VRAM on each card (the ~3 GB besides the shards)."""
+    import gc
+    lines = [f"[MultiGPU TP] MEMDUMP tokens/img {tuple(shape)}"]
+    for d in DEVICES:
+        lines.append(f"  {d}: allocated {torch.cuda.memory_allocated(d) / 2**30:.2f} GiB, reserved {torch.cuda.memory_reserved(d) / 2**30:.2f} GiB")
+    seen, rows = set(), []
+    for o in gc.get_objects():
+        try:
+            if torch.is_tensor(o) and o.is_cuda and o.untyped_storage().data_ptr() not in seen:
+                seen.add(o.untyped_storage().data_ptr())
+                rows.append((o.untyped_storage().nbytes(), str(o.device), tuple(o.shape), str(o.dtype), o.untyped_storage().data_ptr()))
+        except Exception:
+            pass
+    shard_ptrs = set()
+    for tp in _INSTANCES.values():
+        for rank in tp.shards or []:
+            for blk in rank:
+                for v in blk.values():
+                    for t in (v if isinstance(v, tuple) else (v,)):
+                        if torch.is_tensor(t):
+                            shard_ptrs.add(t.untyped_storage().data_ptr())
+    shard, other = {}, {}
+    for nb, dev, shp, dt, ptr in rows:
+        bucket = shard if ptr in shard_ptrs else other
+        bucket[dev] = bucket.get(dev, 0) + nb
+    lines.append("  TP shards: " + ", ".join(f"{k} {v / 2**30:.2f} GiB" for k, v in sorted(shard.items())))
+    lines.append("  everything else python can see: " + ", ".join(f"{k} {v / 2**30:.2f} GiB" for k, v in sorted(other.items())))
+    for nb, dev, shp, dt, ptr in sorted((r for r in rows if r[4] not in shard_ptrs), reverse=True)[:25]:
+        lines.append(f"    {nb / 2**20:9.1f} MiB  {dev}  {dt}  {shp}")
+    logger.warning(chr(10).join(lines))
+
+
 def _per_rank(fn):
     out = []
     for r, dev in enumerate(DEVICES):
@@ -395,6 +431,8 @@ class H3TensorParallel:
             # permanent allocations: keep them out of the compiler's per-forward allocation graph
             with comfy.model_prefetch.pause_malloc_graph(sync=True):
                 self.shards = _load_shards(self.path, len(self.blocks))
+        if i == 0 and MEMDUMP:
+            _memdump(args["img"].shape)
         blk = self.blocks[i]
         x0 = args["img"].float()
         st = self._step_state(args["img"], args)
