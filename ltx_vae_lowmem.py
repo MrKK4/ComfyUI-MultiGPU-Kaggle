@@ -776,7 +776,8 @@ def _dual_tiled_3d(orig):
 
 # Encoder precision: "fp16" (default) runs the conv encoder in fp16 with PixelNorm computed in fp32; "fp32" is the
 # ok-48 behaviour (2 MP: 177 s on a T4). LTX_VAE_ENCODE_FP32=1 (the old switch) still forces fp32.
-ENCODE_MODE = "fp32" if os.environ.get("LTX_VAE_ENCODE_FP32") == "1" else os.environ.get("LTX_VAE_ENCODE", "fp16")
+# fp16 failed the check on both LTX 2.5 VAEs on Kaggle (rel err inf), so fp32 is the default; LTX_VAE_ENCODE=fp16 tries it.
+ENCODE_MODE = "fp32" if os.environ.get("LTX_VAE_ENCODE_FP32") == "1" else os.environ.get("LTX_VAE_ENCODE", "fp32")
 ENCODE_CHECK = os.environ.get("LTX_VAE_ENCODE_CHECK", "1") == "1"
 # The encoder streams the clip through in time chunks sized by cva.get_max_chunk_size: 160 MB on a T4, i.e. 2 frames
 # at 2 MP. Chunks are exact (causal convs keep a temporal cache); this allows 1/16 of the free VRAM per chunk.
@@ -886,6 +887,9 @@ def _encode(orig):
                     st["fp16_ok"] = False
                     logger.warning("[MultiGPU] LTX VAE (%s) encode: fp16 latent not finite, redoing in fp32 (fp32 for this session)", type(self).__name__)
             on_gpu = dev.type == "cuda"
+            # fp32: ComfyUI's own time chunks. Bigger ones ran out of memory in fp32 at 2 MP, and ComfyUI then fell back to
+            # 60 tiles of 256 px (365 s instead of 177 s).
+            _chunk.bytes = None
             out = _encode_as(self, orig, x, torch.float32, *args, **kwargs) if on_gpu else orig(self, x, *args, **kwargs)
             if not torch.isfinite(out).all():
                 raise RuntimeError("LTX VAE (%s) encode produced NaN/inf (%.1f%% of the latent) %s"
