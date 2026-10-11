@@ -809,11 +809,30 @@ def _casts_to_input(module):
     return any(getattr(m, "comfy_cast_weights", False) for m in module.modules())
 
 
+_orig_patchify = cva.patchify
+
+
+def _patchify(*args, **kwargs):
+    """The encoder's per-chunk patchify (it runs on each time chunk just before the chunk goes to the GPU): cast the
+    chunk to the compute dtype here, so a CPU-streamed clip is never copied whole to fp32 in host RAM."""
+    out = _orig_patchify(*args, **kwargs)
+    dtype = getattr(_chunk, "dtype", None)
+    return out.to(dtype) if dtype is not None and out.is_floating_point() else out
+
+
 def _encode_as(self, orig, x, dtype, *args, **kwargs):
     """Encode with the encoder weights and input in `dtype` (weights cast for the call and back)."""
     wdtype = next(self.encoder.parameters()).dtype
     if wdtype != dtype and _casts_to_input(self.encoder):
-        return orig(self, x.to(dtype), *args, **kwargs)
+        if x.device.type == "cuda":
+            return orig(self, x.to(dtype), *args, **kwargs)
+        # CPU-streamed input (conv VideoVAE): a whole 2 MP clip in fp32 is ~3 GB more host RAM (ComfyUI was killed at
+        # 124 frames); cast chunk by chunk instead
+        _chunk.dtype = dtype
+        try:
+            return orig(self, x, *args, **kwargs)
+        finally:
+            _chunk.dtype = None
     if wdtype != dtype:
         self.encoder.to(dtype)
     try:
@@ -913,6 +932,7 @@ def patch_ltx_vae_lowmem():
     cva.VideoVAE.decode = _decode_guard(cva.VideoVAE.decode)
     pn.PixelNorm.forward = _pixel_norm
     cva.get_max_chunk_size = _max_chunk_size
+    cva.patchify = _patchify
     forward._mgpu_lowmem = True
     nd.NeighborhoodAttention3D.forward = forward
     nd.NADiffusionDecoder.forward_diff_step = _forward_diff_step
