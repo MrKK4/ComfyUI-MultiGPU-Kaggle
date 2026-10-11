@@ -830,7 +830,9 @@ def _encode(orig):
     def run(self, x, *args, **kwargs):
         st = _ENC.setdefault(type(self).__name__, {"checked": not ENCODE_CHECK, "fp16_ok": ENCODE_MODE == "fp16"})
         out_dtype = next(self.encoder.parameters()).dtype
-        dev = x.device if x.device.type == "cuda" else next(self.encoder.parameters()).device
+        # the conv VideoVAE streams its input from the CPU (device= says where it runs) and, loaded dynamically, keeps its
+        # weights off the GPU: neither x nor the weights tell the compute device
+        dev = torch.device(kwargs.get("device") or (x.device if x.device.type == "cuda" else next(self.encoder.parameters()).device))
         if dev.type == "cuda" and ENCODE_CHUNK_DIV > 0:
             _chunk.bytes = int(torch.cuda.mem_get_info(dev)[0] / ENCODE_CHUNK_DIV / 2)  # the encoder doubles it
         t0 = time.perf_counter()
@@ -864,11 +866,14 @@ def _encode(orig):
                         return out.to(out_dtype)
                     st["fp16_ok"] = False
                     logger.warning("[MultiGPU] LTX VAE (%s) encode: fp16 latent not finite, redoing in fp32 (fp32 for this session)", type(self).__name__)
-            out = _encode_as(self, orig, x, torch.float32, *args, **kwargs) if dev.type == "cuda" else orig(self, x, *args, **kwargs)
+            on_gpu = dev.type == "cuda"
+            out = _encode_as(self, orig, x, torch.float32, *args, **kwargs) if on_gpu else orig(self, x, *args, **kwargs)
             if not torch.isfinite(out).all():
-                raise RuntimeError("LTX VAE (%s) encode produced NaN/inf (%.1f%% of the latent) even in fp32"
-                                   % (type(self).__name__, 100 * (~torch.isfinite(out)).float().mean().item()))
-            logger.info("[MultiGPU] LTX VAE (%s) encode fp32 %s in %.1fs", type(self).__name__, tuple(x.shape), time.perf_counter() - t0)
+                raise RuntimeError("LTX VAE (%s) encode produced NaN/inf (%.1f%% of the latent) %s"
+                                   % (type(self).__name__, 100 * (~torch.isfinite(out)).float().mean().item(),
+                                      "even in fp32" if on_gpu else "on %s in %s" % (dev, x.dtype)))
+            logger.info("[MultiGPU] LTX VAE (%s) encode %s %s on %s in %.1fs", type(self).__name__, "fp32" if on_gpu else x.dtype,
+                        tuple(x.shape), dev, time.perf_counter() - t0)
             return out.to(out_dtype)
         finally:
             _chunk.bytes = None
