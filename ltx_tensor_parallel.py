@@ -804,6 +804,8 @@ class LTXTensorParallel:
         if ref is not None:
             self.checked = True
             for s, name in ((0, "video"), (1, "audio")):
+                if not ref[s].numel():  # video-only (e.g. upscale / refine): the audio stream has no tokens
+                    continue
                 rel = float((out[0][s].float() - ref[s].float()).norm() / ref[s].float().norm().clamp_min(1e-20))
                 drift = float((out[0][s].float() - out[1][s].float().to(DEVICES[0])).abs().max())
                 logger.info("[MultiGPU LTX TP] block %d check, %s: rel err vs one GPU %.2e, replica drift %.2e", i, name, rel, drift)
