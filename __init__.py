@@ -25,6 +25,7 @@ from .ltx_te_diag import install_te_diag
 from .ltx_tensor_parallel import UNETLoaderLTXTensorParallel
 from .h3_tensor_parallel import UNETLoaderH3TensorParallel
 from .krea2_tensor_parallel import UNETLoaderKrea2TensorParallel
+from .qwen21_tensor_parallel import UNETLoaderQwen21TensorParallel
 from .h3_dual_vae import VAEDecodeH3DualGPU, VAEEncodeH3DualGPU
 from .ltx_dual_vae import VAEDecodeLTXDualGPU
 from .device_utils import (
@@ -837,6 +838,7 @@ NODE_CLASS_MAPPINGS["VAEEncodeH3DualGPU"] = VAEEncodeH3DualGPU
 NODE_CLASS_MAPPINGS["VAEDecodeLTXDualGPU"] = VAEDecodeLTXDualGPU
 NODE_CLASS_MAPPINGS["UNETLoaderLTXTensorParallel"] = UNETLoaderLTXTensorParallel
 NODE_CLASS_MAPPINGS["UNETLoaderKrea2TensorParallel"] = UNETLoaderKrea2TensorParallel
+NODE_CLASS_MAPPINGS["UNETLoaderQwen21TensorParallel"] = UNETLoaderQwen21TensorParallel
 
 for item in registration_data:
     logger.info(fmt_reg.format(item['name'], item['found'], str(item['count'])))
