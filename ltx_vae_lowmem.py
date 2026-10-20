@@ -30,7 +30,9 @@ import traceback
 import torch
 import torch.nn.functional as F
 
+import comfy.ldm.lightricks.vae.causal_video_autoencoder as cva
 import comfy.ldm.lightricks.vae.na_diffusion_decoder as nd
+import comfy.ldm.lightricks.vae.pixel_norm as pn
 import comfy.model_management
 import comfy.sd
 import comfy_kitchen
@@ -772,36 +774,169 @@ def _dual_tiled_3d(orig):
     return run
 
 
-ENCODE_FP32 = os.environ.get("LTX_VAE_ENCODE_FP32", "1") == "1"
+# Encoder precision: "fp16" (default) runs the conv encoder in fp16 with PixelNorm computed in fp32; "fp32" is the
+# ok-48 behaviour (2 MP: 177 s on a T4). LTX_VAE_ENCODE_FP32=1 (the old switch) still forces fp32.
+# fp16 failed the check on both LTX 2.5 VAEs on Kaggle (rel err inf), so fp32 is the default; LTX_VAE_ENCODE=fp16 tries it.
+ENCODE_MODE = "fp32" if os.environ.get("LTX_VAE_ENCODE_FP32") == "1" else os.environ.get("LTX_VAE_ENCODE", "fp32")
+ENCODE_CHECK = os.environ.get("LTX_VAE_ENCODE_CHECK", "1") == "1"
+# The encoder streams the clip through in time chunks sized by cva.get_max_chunk_size: 160 MB on a T4, i.e. 2 frames
+# at 2 MP. Chunks are exact (causal convs keep a temporal cache); this allows 1/16 of the free VRAM per chunk.
+ENCODE_CHUNK_DIV = float(os.environ.get("LTX_VAE_ENCODE_CHUNK_DIV", "16"))
+_ENC = {}  # per VAE class (diffusion VAE, conv VideoVAE): {"checked", "fp16_ok"}
+_DEC_FP32 = set()  # VAE classes whose fp16 decode gave non-finite output this session
+_chunk = threading.local()
+_orig_max_chunk_size = cva.get_max_chunk_size
 
 
-def _encode_fp32(orig):
-    """CausalDiffusionVAE.encode with the encoder in fp32. --fp16-vae is a 2.9x win for the diffusion decoder, but the
-    conv encoder overflows in fp16 and returns an all-NaN latent (upscale / image-to-video came out black). The encoder
-    weights are cast for the call and back; the encode is seconds per job. A non-finite latent raises instead of
-    silently making a black video. LTX_VAE_ENCODE_FP32=0 keeps the old behaviour."""
+def _max_chunk_size(device):
+    return getattr(_chunk, "bytes", None) or _orig_max_chunk_size(device)
+
+
+def _pixel_norm(self, x):
+    """PixelNorm in fp32: in fp16, x**2 overflows above |x| = 256 and eps = 1e-8 rounds to 0, so zero-padded regions
+    give 0/0. This was the all-NaN fp16 encode (kaggle-ok-48 worked around it with a whole fp32 encoder)."""
+    if x.dtype == torch.float32:
+        return _orig_pixel_norm(self, x)
+    xf = x.float()
+    return (xf / torch.sqrt(torch.mean(xf ** 2, dim=self.dim, keepdim=True) + self.eps)).to(x.dtype)
+
+
+_orig_pixel_norm = pn.PixelNorm.forward
+
+
+def _casts_to_input(module):
+    """True when ComfyUI's ops cast this module's weights to the input dtype on the fly (dynamic VRAM / offloaded
+    models): then the input dtype alone picks the compute precision and the weights must not be touched."""
+    return any(getattr(m, "comfy_cast_weights", False) for m in module.modules())
+
+
+_orig_patchify = cva.patchify
+
+
+def _patchify(*args, **kwargs):
+    """The encoder's per-chunk patchify (it runs on each time chunk just before the chunk goes to the GPU): cast the
+    chunk to the compute dtype here, so a CPU-streamed clip is never copied whole to fp32 in host RAM."""
+    out = _orig_patchify(*args, **kwargs)
+    dtype = getattr(_chunk, "dtype", None)
+    return out.to(dtype) if dtype is not None and out.is_floating_point() else out
+
+
+def _encode_as(self, orig, x, dtype, *args, **kwargs):
+    """Encode with the encoder weights and input in `dtype` (weights cast for the call and back)."""
+    wdtype = next(self.encoder.parameters()).dtype
+    if wdtype != dtype and _casts_to_input(self.encoder):
+        if x.device.type == "cuda":
+            return orig(self, x.to(dtype), *args, **kwargs)
+        # CPU-streamed input (conv VideoVAE): a whole 2 MP clip in fp32 is ~3 GB more host RAM (ComfyUI was killed at
+        # 124 frames); cast chunk by chunk instead
+        _chunk.dtype = dtype
+        try:
+            return orig(self, x, *args, **kwargs)
+        finally:
+            _chunk.dtype = None
+    if wdtype != dtype:
+        self.encoder.to(dtype)
+    try:
+        return orig(self, x.to(dtype), *args, **kwargs)
+    finally:
+        if wdtype != dtype:
+            self.encoder.to(wdtype)
+
+
+def _encode(orig):
+    """CausalDiffusionVAE.encode: fp16 encoder (fp32 PixelNorm) with bigger time chunks. The first encode of a session
+    also encodes its first 9 frames in fp32 and compares; a non-finite or off result switches the session to fp32, and
+    a non-finite fp16 latent is redone in fp32, so a bad fp16 encode never reaches the sampler (black video)."""
     def run(self, x, *args, **kwargs):
-        dtype = next(self.encoder.parameters()).dtype
-        if ENCODE_FP32 and dtype in (torch.float16, torch.bfloat16):
-            self.encoder.float()
-            try:
-                out = orig(self, x.float(), *args, **kwargs).to(dtype)
-            finally:
-                self.encoder.to(dtype)
-        else:
+        st = _ENC.setdefault(type(self).__name__, {"checked": not ENCODE_CHECK, "fp16_ok": ENCODE_MODE == "fp16"})
+        out_dtype = next(self.encoder.parameters()).dtype
+        # the conv VideoVAE streams its input from the CPU (device= says where it runs) and, loaded dynamically, keeps its
+        # weights off the GPU: neither x nor the weights tell the compute device
+        dev = torch.device(kwargs.get("device") or (x.device if x.device.type == "cuda" else next(self.encoder.parameters()).device))
+        if dev.type == "cuda" and ENCODE_CHUNK_DIV > 0:
+            _chunk.bytes = int(torch.cuda.mem_get_info(dev)[0] / ENCODE_CHUNK_DIV / 2)  # the encoder doubles it
+        t0 = time.perf_counter()
+        try:
+            if st["fp16_ok"] and dev.type == "cuda":
+                if not st["checked"]:
+                    st["checked"] = True
+                    probe = x[:, :, :min(9, x.shape[2])]
+                    t1 = time.perf_counter()
+                    ref = _encode_as(self, orig, probe, torch.float32, *args, **kwargs).float()
+                    t2 = time.perf_counter()
+                    got = _encode_as(self, orig, probe, torch.float16, *args, **kwargs).float()
+                    t3 = time.perf_counter()
+                    err = ((got - ref).norm() / ref.norm().clamp_min(1e-12)).item() if torch.isfinite(got).all() else float("inf")
+                    st["fp16_ok"] = err < 2e-2
+                    logger.info("[MultiGPU] LTX VAE (%s) encode fp16 check (first %d frames %dx%d): rel err %.2e vs fp32 -> %s | "
+                                "fp32 %.1fs, fp16 %.1fs", type(self).__name__, probe.shape[2], probe.shape[4], probe.shape[3], err,
+                                "fp16" if st["fp16_ok"] else "fp32 for this session", t2 - t1, t3 - t2)
+                if st["fp16_ok"]:
+                    try:
+                        out = _encode_as(self, orig, x, torch.float16, *args, **kwargs)
+                    except torch.OutOfMemoryError:
+                        logger.warning("[MultiGPU] LTX VAE (%s) encode: %d MB time chunks ran out of memory, retrying with ComfyUI's "
+                                       "default | %s", type(self).__name__, 2 * _chunk.bytes >> 20, _gpu_free())
+                        _chunk.bytes = None
+                        torch.cuda.empty_cache()
+                        out = _encode_as(self, orig, x, torch.float16, *args, **kwargs)
+                    if torch.isfinite(out).all():
+                        logger.info("[MultiGPU] LTX VAE (%s) encode fp16 %s in %.1fs (time chunks up to %d MB) | %s", type(self).__name__, tuple(x.shape),
+                                    time.perf_counter() - t0, 2 * (getattr(_chunk, "bytes", None) or 0) >> 20, _gpu_free())
+                        return out.to(out_dtype)
+                    st["fp16_ok"] = False
+                    logger.warning("[MultiGPU] LTX VAE (%s) encode: fp16 latent not finite, redoing in fp32 (fp32 for this session)", type(self).__name__)
+            on_gpu = dev.type == "cuda"
+            # fp32: ComfyUI's own time chunks. Bigger ones ran out of memory in fp32 at 2 MP, and ComfyUI then fell back to
+            # 60 tiles of 256 px (365 s instead of 177 s).
+            _chunk.bytes = None
+            out = _encode_as(self, orig, x, torch.float32, *args, **kwargs) if on_gpu else orig(self, x, *args, **kwargs)
+            if not torch.isfinite(out).all():
+                raise RuntimeError("LTX VAE (%s) encode produced NaN/inf (%.1f%% of the latent) %s"
+                                   % (type(self).__name__, 100 * (~torch.isfinite(out)).float().mean().item(),
+                                      "even in fp32" if on_gpu else "on %s in %s" % (dev, x.dtype)))
+            logger.info("[MultiGPU] LTX VAE (%s) encode %s %s on %s in %.1fs", type(self).__name__, "fp32" if on_gpu else x.dtype,
+                        tuple(x.shape), dev, time.perf_counter() - t0)
+            return out.to(out_dtype)
+        finally:
+            _chunk.bytes = None
+    return run
+
+
+def _decode_guard(orig):
+    """Conv VideoVAE.decode: an fp16 decode that comes out non-finite (black video) is redone with the decoder in fp32,
+    and the rest of the session decodes in fp32."""
+    def run(self, x, *args, **kwargs):
+        name = type(self).__name__
+        wdtype = next(self.decoder.parameters()).dtype
+        if name not in _DEC_FP32 or wdtype == torch.float32:
             out = orig(self, x, *args, **kwargs)
-        if not torch.isfinite(out).all():
-            raise RuntimeError("LTX VAE encode produced NaN/inf (%.1f%% of the latent; encoder dtype %s). Set "
-                               "LTX_VAE_ENCODE_FP32=1 or drop --fp16-vae." % (100 * (~torch.isfinite(out)).float().mean().item(),
-                                                                             torch.float32 if ENCODE_FP32 else dtype))
-        return out
+            got = out if torch.is_tensor(out) else kwargs.get("output_buffer", args[0] if args else None)
+            if wdtype == torch.float32 or not torch.is_tensor(got) or bool(torch.isfinite(got).all()):
+                return out
+            _DEC_FP32.add(name)
+            logger.warning("[MultiGPU] LTX VAE (%s) decode: fp16 output not finite, redoing in fp32 (fp32 for this session)", name)
+        if _casts_to_input(self.decoder):
+            out = orig(self, x.float(), *args, **kwargs)
+        else:
+            self.decoder.float()
+            try:
+                out = orig(self, x.float(), *args, **kwargs)
+            finally:
+                self.decoder.to(wdtype)
+        return out.to(wdtype) if torch.is_tensor(out) else out
     return run
 
 
 def patch_ltx_vae_lowmem():
     if getattr(nd.NeighborhoodAttention3D.forward, "_mgpu_lowmem", False):
         return
-    nd.CausalDiffusionVAE.encode = _encode_fp32(nd.CausalDiffusionVAE.encode)
+    nd.CausalDiffusionVAE.encode = _encode(nd.CausalDiffusionVAE.encode)
+    cva.VideoVAE.encode = _encode(cva.VideoVAE.encode)  # the conv VAE's encoder also NaNs in fp16
+    cva.VideoVAE.decode = _decode_guard(cva.VideoVAE.decode)
+    pn.PixelNorm.forward = _pixel_norm
+    cva.get_max_chunk_size = _max_chunk_size
+    cva.patchify = _patchify
     forward._mgpu_lowmem = True
     nd.NeighborhoodAttention3D.forward = forward
     nd.NADiffusionDecoder.forward_diff_step = _forward_diff_step

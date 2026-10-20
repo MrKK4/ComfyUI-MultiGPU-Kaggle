@@ -756,7 +756,7 @@ class LTXTensorParallel:
             self._apply_lora()
         vx, ax = args["img"]
         if i == 0:
-            self._make_room(vx.shape[1])
+            self._make_room(vx.shape[0] * vx.shape[1])  # a batch (e.g. cond + uncond together) multiplies the activations
             for d in DEVICES:
                 torch.cuda.reset_peak_memory_stats(d)
             self.fwd_start = [torch.cuda.memory_allocated(d) for d in DEVICES]
@@ -804,6 +804,8 @@ class LTXTensorParallel:
         if ref is not None:
             self.checked = True
             for s, name in ((0, "video"), (1, "audio")):
+                if not ref[s].numel():  # video-only (e.g. upscale / refine): the audio stream has no tokens
+                    continue
                 rel = float((out[0][s].float() - ref[s].float()).norm() / ref[s].float().norm().clamp_min(1e-20))
                 drift = float((out[0][s].float() - out[1][s].float().to(DEVICES[0])).abs().max())
                 logger.info("[MultiGPU LTX TP] block %d check, %s: rel err vs one GPU %.2e, replica drift %.2e", i, name, rel, drift)
@@ -1027,6 +1029,17 @@ class UNETLoaderLTXTensorParallel:
         for i in range(len(dm.transformer_blocks)):
             model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
                                           "dit", "double_block", i)
+        # ComfyUI batches cond and uncond into one forward when memory_required says it fits; it cannot see the shards, so
+        # CFGGuider at 2 MP ran a 2 x 32640-token forward next to them and ran GPU 0 out of memory. One cond per forward
+        # (as LTXVDualCFGGuider does) costs the same compute here: the blocks are compute-bound.
+        base = model.model
+        if not getattr(base.memory_required, "_ltx_tp", False):
+            one_cond = base.memory_required
+
+            def memory_required(input_shape, *args, **kwargs):
+                return float("inf") if input_shape[0] > 1 else one_cond(input_shape, *args, **kwargs)
+            memory_required._ltx_tp = True
+            base.memory_required = memory_required
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "ltx_tp", _no_block_prefetch)
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "ltx_tp",
                                    lambda executor, *a, **k: _sampling(tp, executor, *a, **k))
