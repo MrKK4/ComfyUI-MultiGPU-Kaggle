@@ -217,8 +217,8 @@ class Qwen21TensorParallel:
     def block(self, i, x, mod, pe, attn_fn, prefix_len, transformer_options={}):
         blk = self.blocks[i]
         kind = attn_kind(attn_fn)
-        if (kind is None or x.dtype != torch.float16 or comfy.model_management.in_training
-                or transformer_options.get("patches", {}).get("attn1_patch")):
+        if (kind is None or x.dtype != torch.float16 or comfy.model_management.in_training or self.lora[2]
+                or transformer_options.get("patches", {}).get("attn1_patch")):   # self.lora[2]: patches TP cannot apply
             self.fallback += 1
             return qm.QwenImage21TransformerBlock.forward(blk, x, mod, pe, attn_fn, prefix_len, transformer_options)
         if self.gpu is None:
@@ -284,12 +284,18 @@ def lora_spec(patches):
         layer = _LORA_LAYERS.get(m.group(2))
         for strength, adapter, strength_model, offset, function in plist:
             w = getattr(adapter, "weights", None)
-            if not (layer is not None and offset is None and function is None and strength_model == 1.0
+            # diffusers-format LoRAs address gate_layer / proj: ComfyUI maps them onto rows of the fused gate_up (offset)
+            row_offset = offset is not None and layer is not None and layer[1] == "gu" and offset[0] == 0
+            if not (layer is not None and (offset is None or row_offset) and function is None and strength_model == 1.0
                     and type(adapter).__name__ == "LoRAAdapter" and w is not None and len(w) >= 3 and all(x is None for x in w[3:])):
                 unsupported.append(k)
                 continue
             up, down, alpha = w[0], w[1], w[2]
             scale = float(strength) * (float(alpha) / down.shape[0] if alpha is not None else 1.0)
+            if row_offset:   # B for the whole fused weight, zero outside this half (gate and up halves have the same length)
+                full = up.new_zeros((2 * offset[2],) + tuple(up.shape[1:]))
+                full[offset[1]:offset[1] + offset[2]] = up
+                up = full
             spec.setdefault((int(m.group(1)),) + layer, []).append((down, up, scale))
             key.append((k, id(adapter), float(strength)))
     return spec, tuple(sorted(key)), unsupported
@@ -298,8 +304,8 @@ def lora_spec(patches):
 def _sampling(tp, executor, *args, **kwargs):
     tp.lora = lora_spec(getattr(executor.class_obj.model_patcher, "patches", {}))
     if tp.lora[2]:
-        logger.warning("[MultiGPU Qwen21 TP] %d patch keys on blocks are NOT applied under tensor parallel (only plain LoRA on the "
-                       "block linears is; e.g. %s)", len(tp.lora[2]), tp.lora[2][0])
+        logger.warning("[MultiGPU Qwen21 TP] %d patch keys on blocks cannot be split (only plain LoRA on the block linears "
+                       "can): this run uses ONE GPU so they apply correctly; e.g. %s", len(tp.lora[2]), tp.lora[2][0])
     t0 = time.perf_counter()
     try:
         return executor(*args, **kwargs)
