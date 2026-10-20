@@ -13,12 +13,14 @@ are always the base weights; LoRA stays a side path as with file shards.
 import importlib
 import json
 import logging
+import os
 from collections import OrderedDict
 
 import torch
 
 logger = logging.getLogger("MultiGPU")
 GROUP = 256
+REQUANT_ALL = os.environ.get("MULTIGPU_TP_REQUANT") == "1"   # test: treat int8 convrot weights like any other format
 
 
 def open_weights(source):
@@ -109,6 +111,8 @@ class ModelWeights:
         return tuple(getattr(w, "tensor_shape", None) or w.shape)
 
     def _native_int8(self, lin):
+        if REQUANT_ALL:
+            return False
         w = self.params[lin + ".weight"]
         p = getattr(w, "_params", None)
         return (getattr(w, "_layout_cls", None) == "TensorWiseINT8Layout" and getattr(p, "convrot", False)
