@@ -264,20 +264,31 @@ class UNETLoaderKrea2TensorParallel:
             raise RuntimeError("Krea 2 tensor parallel needs two CUDA devices")
         path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         model = comfy.sd.load_diffusion_model(path)
-        dm = model.model.diffusion_model
-        if not hasattr(dm, "blocks") or not isinstance(dm.blocks[0], SingleStreamBlock):
+        if not supports(model.model.diffusion_model):
             raise ValueError("UNETLoaderKrea2TensorParallel only supports Krea 2 checkpoints")
-        comfy.cli_args.args.disable_comfy_compiler = True  # the compiler records one device's allocations; TP allocates on two
-        tp = _INSTANCES.get(path)
-        if tp is None:
-            tp = _INSTANCES[path] = Krea2TensorParallel(path, dm)
+        attach(model, path, path)
+        return (model,)
+
+
+def supports(dm):
+    return hasattr(dm, "blocks") and len(dm.blocks) > 0 and isinstance(dm.blocks[0], SingleStreamBlock)
+
+
+def attach(model, source, key):
+    """Runs the blocks of `model` (a ModelPatcher) on both GPUs; shards come from `source` (checkpoint path or
+    tp_source.ModelWeights) and are cached under `key`."""
+    dm = model.model.diffusion_model
+    comfy.cli_args.args.disable_comfy_compiler = True  # the compiler records one device's allocations; TP allocates on two
+    tp = _INSTANCES.get(key)
+    if tp is None:
+        tp = _INSTANCES[key] = Krea2TensorParallel(source, dm)
+    if getattr(dm, "_mgpu_tp", None) is not tp:   # once per model object (patcher clones share it)
+        dm._mgpu_tp = tp
         tp.blocks = dm.blocks  # shards stay; only the fallback path and the check use the model's own blocks
         for i, blk in enumerate(dm.blocks):
             blk.forward = lambda *a, i=i, **k: tp.block(i, *a, **k)
         if os.environ.get("KREA2_TXT_CACHE", "1") != "0":
             orig = dm.txtfusion.forward
             dm.txtfusion.forward = lambda *a, **k: _txtfusion(tp, orig, *a, **k)
-        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "krea2_tp", L._no_block_prefetch)
-        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "krea2_tp",
-                                   lambda executor, *a, **k: _sampling(tp, executor, *a, **k))
-        return (model,)
+    L.add_wrappers(model, "krea2_tp", lambda executor, *a, **k: _sampling(tp, executor, *a, **k))
+    return tp

@@ -21,6 +21,8 @@ from collections import defaultdict
 import torch
 from safetensors import safe_open
 
+from .tp_source import open_weights
+
 import comfy.cli_args
 import comfy.model_management
 import comfy.model_prefetch
@@ -229,7 +231,7 @@ def _rows(t, chunk, part, rank):
 def _load_shards(path, n_blocks):
     if path in _SHARD_CACHE:
         return _SHARD_CACHE[path]
-    with safe_open(path, framework="pt", device="cpu") as f:
+    with open_weights(path) as f:   # checkpoint path, or tp_source.ModelWeights of a loaded model
         layers = json.loads(f.metadata()["_quantization_metadata"])["layers"]
         need = 0
         for k in ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"):
@@ -579,21 +581,34 @@ class UNETLoaderH3TensorParallel:
             raise RuntimeError("H3 tensor parallel needs two CUDA devices")
         path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         model = comfy.sd.load_diffusion_model(path)
-        dm = model.model.diffusion_model
-        if not isinstance(dm, h3.MiniMaxH3Model):
+        if not supports(model.model.diffusion_model):
             raise ValueError("UNETLoaderH3TensorParallel only supports MiniMax H3 checkpoints")
-        # the Comfy compiler records one device's allocations per forward; TP allocates on two.
-        # ponytail: process-wide, Split in the same session runs without the compiler
-        comfy.cli_args.args.disable_comfy_compiler = True
-        tp = _INSTANCES.get(path)
-        if tp is None:
-            tp = _INSTANCES[path] = H3TensorParallel(path, dm)
-        else:
-            tp.blocks = dm.blocks  # shards stay; norms/adaln come from the freshly loaded model
-        for i in range(len(dm.blocks)):
-            model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
-                                          "dit", "double_block", i)
+        attach(model, path, path)
+        return (model,)
+
+
+def supports(dm):
+    return isinstance(dm, h3.MiniMaxH3Model)
+
+
+def attach(model, source, key):
+    """Runs the blocks of `model` (a ModelPatcher) on both GPUs; shards come from `source` (checkpoint path or
+    tp_source.ModelWeights) and are cached under `key`."""
+    dm = model.model.diffusion_model
+    # the Comfy compiler records one device's allocations per forward; TP allocates on two.
+    # ponytail: process-wide, Split in the same session runs without the compiler
+    comfy.cli_args.args.disable_comfy_compiler = True
+    tp = _INSTANCES.get(key)
+    if tp is None:
+        tp = _INSTANCES[key] = H3TensorParallel(source, dm)
+    else:
+        tp.blocks = dm.blocks  # shards stay; norms/adaln come from the freshly loaded model
+    dm._mgpu_tp = tp
+    for i in range(len(dm.blocks)):
+        model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
+                                      "dit", "double_block", i)
+    if not model.get_wrappers(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "mmh3_tp"):
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "mmh3_tp", _no_block_prefetch)
         model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "mmh3_tp",
                                    lambda executor, *a, **k: _prepare_sampling(tp, executor, *a, **k))
-        return (model,)
+    return tp

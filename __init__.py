@@ -840,6 +840,10 @@ NODE_CLASS_MAPPINGS["UNETLoaderLTXTensorParallel"] = UNETLoaderLTXTensorParallel
 NODE_CLASS_MAPPINGS["UNETLoaderKrea2TensorParallel"] = UNETLoaderKrea2TensorParallel
 NODE_CLASS_MAPPINGS["UNETLoaderQwen21TensorParallel"] = UNETLoaderQwen21TensorParallel
 
+# every supported model samples on both GPUs whatever loaded it (MULTIGPU_TP_AUTO=0 off)
+from .tp_auto import install as _install_tp_auto
+_install_tp_auto()
+
 for item in registration_data:
     logger.info(fmt_reg.format(item['name'], item['found'], str(item['count'])))
 logger.info(dash_line)

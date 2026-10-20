@@ -217,7 +217,8 @@ class Qwen21TensorParallel:
     def block(self, i, x, mod, pe, attn_fn, prefix_len, transformer_options={}):
         blk = self.blocks[i]
         kind = attn_kind(attn_fn)
-        if kind is None or comfy.model_management.in_training or transformer_options.get("patches", {}).get("attn1_patch"):
+        if (kind is None or x.dtype != torch.float16 or comfy.model_management.in_training
+                or transformer_options.get("patches", {}).get("attn1_patch")):
             self.fallback += 1
             return qm.QwenImage21TransformerBlock.forward(blk, x, mod, pe, attn_fn, prefix_len, transformer_options)
         if self.gpu is None:
@@ -330,17 +331,31 @@ class UNETLoaderQwen21TensorParallel:
             model = comfy.sd.load_diffusion_model(path)
         finally:
             cfg.supported_inference_dtypes = allowed
-        dm = model.model.diffusion_model
-        if not hasattr(dm, "transformer_blocks") or not isinstance(dm.transformer_blocks[0], qm.QwenImage21TransformerBlock):
+        if not supports(model.model.diffusion_model):
             raise ValueError("UNETLoaderQwen21TensorParallel only supports Qwen-Image 2.1 checkpoints")
-        comfy.cli_args.args.disable_comfy_compiler = True  # the compiler records one device's allocations; TP allocates on two
-        tp = _INSTANCES.get(path)
-        if tp is None:
-            tp = _INSTANCES[path] = Qwen21TensorParallel(path, dm)
+        attach(model, path, path)
+        return (model,)
+
+
+def supports(dm):
+    return hasattr(dm, "transformer_blocks") and len(dm.transformer_blocks) > 0 and isinstance(dm.transformer_blocks[0], qm.QwenImage21TransformerBlock)
+
+
+def attach(model, source, key):
+    """Runs the blocks of `model` (a ModelPatcher) on both GPUs; shards come from `source` (checkpoint path or
+    tp_source.ModelWeights) and are cached under `key`. The model must compute in fp16 (the loader node and the
+    automatic path load or switch it so)."""
+    dm, base = model.model.diffusion_model, model.model
+    if base.get_dtype_inference() != torch.float16 and (base.manual_cast_dtype is not None or base.get_dtype() == torch.float16):
+        base.manual_cast_dtype = torch.float16   # T4: no bf16, ComfyUI would compute in fp32 (Phase 0: same quality, 26% faster)
+    comfy.cli_args.args.disable_comfy_compiler = True  # the compiler records one device's allocations; TP allocates on two
+    tp = _INSTANCES.get(key)
+    if tp is None:
+        tp = _INSTANCES[key] = Qwen21TensorParallel(source, dm)
+    if getattr(dm, "_mgpu_tp", None) is not tp:   # once per model object (patcher clones share it)
+        dm._mgpu_tp = tp
         tp.blocks = dm.transformer_blocks  # shards stay; only the fallback path and the check use the model's own blocks
         for i, blk in enumerate(dm.transformer_blocks):
             blk.forward = lambda *a, i=i, **k: tp.block(i, *a, **k)
-        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "qwen21_tp", L._no_block_prefetch)
-        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "qwen21_tp",
-                                   lambda executor, *a, **k: _sampling(tp, executor, *a, **k))
-        return (model,)
+    L.add_wrappers(model, "qwen21_tp", lambda executor, *a, **k: _sampling(tp, executor, *a, **k))
+    return tp

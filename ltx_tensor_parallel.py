@@ -22,6 +22,8 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from .tp_source import open_weights
+
 import comfy.cli_args
 import comfy.ldm.common_dit
 import comfy.model_management
@@ -126,7 +128,7 @@ def _block_cpu(f, keys, meta, pre, rank):
 
 
 def _open(path):
-    f = safe_open(path, framework="pt", device="cpu")
+    f = open_weights(path)   # checkpoint path, or tp_source.ModelWeights of a loaded model
     return f, set(f.keys()), json.loads((f.metadata() or {}).get("_quantization_metadata", "{}")).get("layers", {})
 
 
@@ -1016,31 +1018,48 @@ class UNETLoaderLTXTensorParallel:
             raise RuntimeError("LTX tensor parallel needs two CUDA devices")
         path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         model = comfy.sd.load_diffusion_model(path)
-        dm = model.model.diffusion_model
-        if not hasattr(dm, "transformer_blocks") or not isinstance(dm.transformer_blocks[0], BasicAVTransformerBlock):
+        if not supports(model.model.diffusion_model):
             raise ValueError("UNETLoaderLTXTensorParallel only supports LTX 2.x audio-video checkpoints")
-        # the Comfy compiler records one device's allocations per forward; TP allocates on two
-        comfy.cli_args.args.disable_comfy_compiler = True
-        tp = _INSTANCES.get(path)
-        if tp is None:
-            tp = _INSTANCES[path] = LTXTensorParallel(path, dm)
-        else:
-            tp.blocks = dm.transformer_blocks  # shards stay; everything they need comes from the checkpoint
-        for i in range(len(dm.transformer_blocks)):
-            model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
-                                          "dit", "double_block", i)
-        # ComfyUI batches cond and uncond into one forward when memory_required says it fits; it cannot see the shards, so
-        # CFGGuider at 2 MP ran a 2 x 32640-token forward next to them and ran GPU 0 out of memory. One cond per forward
-        # (as LTXVDualCFGGuider does) costs the same compute here: the blocks are compute-bound.
-        base = model.model
-        if not getattr(base.memory_required, "_ltx_tp", False):
-            one_cond = base.memory_required
-
-            def memory_required(input_shape, *args, **kwargs):
-                return float("inf") if input_shape[0] > 1 else one_cond(input_shape, *args, **kwargs)
-            memory_required._ltx_tp = True
-            base.memory_required = memory_required
-        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "ltx_tp", _no_block_prefetch)
-        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, "ltx_tp",
-                                   lambda executor, *a, **k: _sampling(tp, executor, *a, **k))
+        attach(model, path, path)
         return (model,)
+
+
+def supports(dm):
+    return hasattr(dm, "transformer_blocks") and len(dm.transformer_blocks) > 0 and isinstance(dm.transformer_blocks[0], BasicAVTransformerBlock)
+
+
+def add_wrappers(model, key, sampling):
+    """Block-prefetch off + the sampling-run wrapper on a ModelPatcher, once per patcher (clones copy them)."""
+    if not model.get_wrappers(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, key):
+        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, key, _no_block_prefetch)
+        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, key, sampling)
+
+
+def attach(model, source, key):
+    """Runs the blocks of `model` (a ModelPatcher) on both GPUs; shards come from `source` (checkpoint path or
+    tp_source.ModelWeights) and are cached under `key`."""
+    dm = model.model.diffusion_model
+    # the Comfy compiler records one device's allocations per forward; TP allocates on two
+    comfy.cli_args.args.disable_comfy_compiler = True
+    tp = _INSTANCES.get(key)
+    if tp is None:
+        tp = _INSTANCES[key] = LTXTensorParallel(source, dm)
+    else:
+        tp.blocks = dm.transformer_blocks  # shards stay; everything they need comes from the checkpoint
+    dm._mgpu_tp = tp
+    for i in range(len(dm.transformer_blocks)):
+        model.set_model_patch_replace(lambda args, extra, i=i: tp.block(i, args, extra["original_block"]),
+                                      "dit", "double_block", i)
+    # ComfyUI batches cond and uncond into one forward when memory_required says it fits; it cannot see the shards, so
+    # CFGGuider at 2 MP ran a 2 x 32640-token forward next to them and ran GPU 0 out of memory. One cond per forward
+    # (as LTXVDualCFGGuider does) costs the same compute here: the blocks are compute-bound.
+    base = model.model
+    if not getattr(base.memory_required, "_ltx_tp", False):
+        one_cond = base.memory_required
+
+        def memory_required(input_shape, *args, **kwargs):
+            return float("inf") if input_shape[0] > 1 else one_cond(input_shape, *args, **kwargs)
+        memory_required._ltx_tp = True
+        base.memory_required = memory_required
+    add_wrappers(model, "ltx_tp", lambda executor, *a, **k: _sampling(tp, executor, *a, **k))
+    return tp
