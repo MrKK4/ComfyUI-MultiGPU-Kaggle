@@ -27,7 +27,10 @@ def open_weights(source):
     """safetensors handle for a checkpoint path, or `source` itself (a ModelWeights)."""
     if isinstance(source, str):
         from safetensors import safe_open
-        return safe_open(source, framework="pt", device="cpu")
+        from .tp_native_layout import NativeLayoutFile, needs_wrapper
+        handle = safe_open(source, framework="pt", device="cpu")
+        # ComfyUI's native layout (Comfy-Org, community int8 files): config in `.comfy_quant` tensors, keys prefixed
+        return NativeLayoutFile(handle) if needs_wrapper(handle) else handle
     return source
 
 
