@@ -43,6 +43,9 @@ HEAD = 128
 DEVICES = (torch.device("cuda:0"), torch.device("cuda:1"))
 _SHARD_CACHE = {}
 CHUNKS = max(1, int(os.environ.get("MMH3_TP_CHUNKS", "4")))
+# Timing aid: with XCHG_OFF (env MULTIGPU_TP_XCHG_OFF=1, or set the module attribute at run time) the partial sums are not exchanged. The output is wrong; the step time
+# shows what the exchange costs.
+XCHG_OFF = os.environ.get("MULTIGPU_TP_XCHG_OFF", "0") == "1"
 # next block's norm1 + qkv for finished chunks, queued behind the last mlp exchange of this block
 QKV_PREFETCH = os.environ.get("MMH3_TP_QKV_PREFETCH", "1") != "0"
 # Bound norm, quantization and LoRA output temporaries independently of video length.
@@ -82,6 +85,8 @@ class _ChunkedExchange:
 
     def send(self, phase, shape, rows, parts):
         """D2H of parts[r] (rank r's partial for `rows`) into host[r]; returns the copy-done events."""
+        if XCHG_OFF:
+            return parts
         a, b = rows
         buf, sent = self._buf(phase, shape, parts[0].dtype), []
         for r, dev in enumerate(DEVICES):
@@ -103,6 +108,8 @@ class _ChunkedExchange:
 
     def recv(self, phase, shape, rows, sent):
         """H2D of the other rank's rows; returns per-rank views, ready on each compute stream."""
+        if XCHG_OFF:
+            return list(sent)
         a, b = rows
         buf, out = self._buf(phase, shape), []
         for r, dev in enumerate(DEVICES):
@@ -610,6 +617,7 @@ class H3TensorParallel:
             rel = float((x0 - ref).norm() / ref.norm())
             drift = float((x0 - x1.to(d0)).abs().max())
             logger.info(f"[MultiGPU TP] block {i} check: rel err vs single-GPU {rel:.2e}, replica drift {drift:.2e}")
+            logger.info(f"[TP-CHECK] block{i} rel_err={rel:.3e} drift={drift:.3e} finite={bool(torch.isfinite(x0).all())}")
         st["x0"], st["x1"] = x0, x1
         return {"img": x0}
 
