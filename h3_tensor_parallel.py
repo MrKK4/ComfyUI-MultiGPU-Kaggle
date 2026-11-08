@@ -325,7 +325,8 @@ class H3TensorParallel:
         for d in DEVICES:
             torch.cuda.synchronize(d)
         self.xchg.bufs.clear()
-        if drop_shards and self.shards is not None:
+        if drop_shards:
+            _SHARD_CACHE.pop(self.path, None)   # the cache holds the same tensors: without this nothing is freed
             self.shards = None
             logger.warning("[MultiGPU TP] shards released to make room; the next sampling run re-shards them")
         for d in DEVICES:
