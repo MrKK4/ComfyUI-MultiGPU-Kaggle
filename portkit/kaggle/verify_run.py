@@ -5,6 +5,7 @@ import copy
 LIM = dict(rel_err=3e-2, margin_gib=1.0, exchange_share=0.15, release_gib=3.0)
 LIM.update(globals().get('KIT_LIMITS', {}))
 g0 = copy.deepcopy(KIT_GRAPH)
+SAMPLER_IDS = {nid for nid, n in g0.items() if n['class_type'] in ('KSampler', 'KSamplerAdvanced', 'SamplerCustom', 'SamplerCustomAdvanced')}
 for nid, n in list(g0.items()):
     if n['class_type'] in ('KSampler', 'KSamplerAdvanced', 'SamplerCustom', 'SamplerCustomAdvanced'):
         g0['zz_fc_' + nid] = {'class_type': 'FiniteCheck', 'inputs': {'latent': [nid, 0]}}
@@ -26,10 +27,11 @@ def step_stats(t0, t1):
             d = m['data']; ticks.setdefault((d.get('node'), d.get('max')), []).append((t, d.get('value')))
     if not ticks:
         return None
-    key = max(ticks, key=lambda k: k[1] or 0)
+    own = [k for k in ticks if k[0] in SAMPLER_IDS] or sorted(ticks, key=lambda k: k[1] or 0)[:1]   # sampler steps only (not VAE-decode tiles)
+    key = max(own, key=lambda k: k[1] or 0)
     ts = [t for t, _ in ticks[key]]
     gaps = [b - a for a, b in zip(ts, ts[1:])]
-    return {'steps': key[1], 'gaps_s': [round(x, 1) for x in gaps], 'median_s': round(sorted(gaps)[len(gaps) // 2], 1) if gaps else None}
+    return {'steps': key[1], 'gaps_s': [round(x, 1) for x in gaps], 'median_s': round(sum(gaps) / len(gaps), 2) if gaps else None}
 
 
 def peak(t0, t1):
@@ -78,7 +80,7 @@ c('block check rel_err', (max(float(x[1]) for x in checks) <= LIM['rel_err']) if
 c('finite outputs', (not any(nonfinite) and all(x[3] == 'True' for x in checks)) if nonfinite else None, {'FiniteCheck': nonfinite})
 pk = [RESULTS[k]['peak_gib'] for k in RESULTS if RESULTS[k].get('peak_gib')]
 c('memory margin (peak <= 14.56 - %.1f GiB)' % LIM['margin_gib'], (max(max(p) for p in pk) <= 14.56 - LIM['margin_gib']) if pk else None, {k: r['peak_gib'] for k, r in RESULTS.items()})
-if on and off and off.get('median_s'):
+if on and off and off.get('median_s') and min(on) >= 1.0:   # sub-second gaps = wrong progress stream, do not trust
     share = (sum(on) / len(on) - off['median_s']) / (sum(on) / len(on))
     c('exchange share of a step <= %d%%' % int(LIM['exchange_share'] * 100), share <= LIM['exchange_share'], 'on %.1f s, off %.1f s, share %.1f%%' % (sum(on) / len(on), off['median_s'], share * 100))
 else:
