@@ -44,6 +44,8 @@ def _release_others(keep):
 
 def _drop(mod, key):
     tp = mod._INSTANCES.pop(key)
+    if hasattr(tp, "release"):
+        tp.release(drop_shards=True)
     getattr(mod, "_SHARD_CACHE", {}).pop(tp.path, None)   # H3 caches shards by source
     for attr in ("gpu", "host", "shards"):
         if getattr(tp, attr, None) is not None:

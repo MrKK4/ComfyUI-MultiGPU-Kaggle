@@ -31,6 +31,16 @@ Tensor-parallel tuning: `MMH3_TP_CHUNKS` (exchange row chunks, default 4), `MMH3
 qkv prefetch), `MMH3_TP_SIDE_STREAMS=0` (copies on the compute streams), `MMH3_TP_CHECK=1` (run a one-time
 numerical check against the original blocks). `tp_profile.request` in ComfyUI's working dir profiles one sampling step into `tp_profile.txt`.
 
+H3 memory handling now bounds QKV norm/linear/LoRA temporaries to `MMH3_TP_QKV_ROWS` rows (default 4096).
+`MMH3_TP_LORA_MODE=auto` chooses resident or per-block streamed LoRA weights using the actual token count,
+available memory on both cards and total adapter size. `resident` and `stream` override that choice for diagnosis.
+GPU LoRA copies and exchange buffers are released after sampling; base shards remain warm until a different
+H3 checkpoint loads or an explicit unload releases them and their cache. Optional QKV prefetch checks available
+memory and is disabled for streamed adapters. Unsupported block patch formats raise an error rather than losing
+their effect. These policies apply across supported H3 checkpoints and ordinary stacked LoRAs; they do not make
+arbitrary resolutions, adapter formats or workflow memory requirements fit every GPU. GPU regression validation
+for this change is tracked in Comfy Remote's `tests/h3_vae_audit/stability_kernel` experiment.
+
 ### Measured on Kaggle 2× T4
 | Workload | Before | With this fork |
 |---|---|---|

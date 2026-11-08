@@ -840,6 +840,10 @@ NODE_CLASS_MAPPINGS["UNETLoaderLTXTensorParallel"] = UNETLoaderLTXTensorParallel
 NODE_CLASS_MAPPINGS["UNETLoaderKrea2TensorParallel"] = UNETLoaderKrea2TensorParallel
 NODE_CLASS_MAPPINGS["UNETLoaderQwen21TensorParallel"] = UNETLoaderQwen21TensorParallel
 
+# Explicit opt-in node: native TRELLIS.2/Pixal3D head-parallel attention, with unchanged compute precision.
+from .trellis2_dual_attention import NODE_CLASS_MAPPINGS as _trellis2_dual_nodes
+NODE_CLASS_MAPPINGS.update(_trellis2_dual_nodes)
+
 # every supported model samples on both GPUs whatever loaded it (MULTIGPU_TP_AUTO=0 off)
 from .tp_auto import install as _install_tp_auto
 _install_tp_auto()

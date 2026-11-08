@@ -45,6 +45,11 @@ _SHARD_CACHE = {}
 CHUNKS = max(1, int(os.environ.get("MMH3_TP_CHUNKS", "4")))
 # next block's norm1 + qkv for finished chunks, queued behind the last mlp exchange of this block
 QKV_PREFETCH = os.environ.get("MMH3_TP_QKV_PREFETCH", "1") != "0"
+# Bound norm, quantization and LoRA output temporaries independently of video length.
+QKV_ROWS = max(1, int(os.environ.get("MMH3_TP_QKV_ROWS", "4096")))
+LORA_MODE = os.environ.get("MMH3_TP_LORA_MODE", "auto")
+if LORA_MODE not in ("auto", "resident", "stream"):
+    raise ValueError("MMH3_TP_LORA_MODE must be auto, resident or stream")
 
 
 def _record(dev, stream=None):
@@ -199,6 +204,8 @@ def _memdump(shape):
     shard_ptrs = set()
     for tp in _INSTANCES.values():
         for rank in tp.shards or []:
+            if rank is None:
+                continue
             for blk in rank:
                 for v in blk.values():
                     for t in (v if isinstance(v, tuple) else (v,)):
@@ -229,8 +236,14 @@ def _rows(t, chunk, part, rank):
 
 
 def _load_shards(path, n_blocks):
-    if path in _SHARD_CACHE:
-        return _SHARD_CACHE[path]
+    cached = _SHARD_CACHE.get(path)
+    if cached is not None and all(rank is not None for rank in cached):
+        logger.info('[MultiGPU TP] reusing both resident shard ranks')
+        return cached
+    missing = [rank for rank in range(len(DEVICES)) if cached is None or cached[rank] is None]
+    started = time.perf_counter()
+    logger.info('[MultiGPU TP] loading shard ranks %s; retained ranks %s', missing,
+                [rank for rank in range(len(DEVICES)) if rank not in missing])
     with open_weights(path) as f:   # checkpoint path, or tp_source.ModelWeights of a loaded model
         layers = json.loads(f.metadata()["_quantization_metadata"])["layers"]
         need = 0
@@ -240,9 +253,13 @@ def _load_shards(path, n_blocks):
                 raise ValueError(f"tensor parallel needs the int8 convrot checkpoint; blocks.0.{k} is {conf}")
             need += f.get_slice(f"blocks.0.{k}.weight").get_shape()[0] * f.get_slice(f"blocks.0.{k}.weight").get_shape()[1]
         need = int(need * n_blocks / 2 * 1.08)
-        for dev in DEVICES:
-            comfy.model_management.free_memory(need + (2 << 30), dev)
-        shards = [[], []]
+        for rank in missing:
+            comfy.model_management.free_memory(need + (2 << 30), DEVICES[rank])
+        # Build into a separate list so a failed restore cannot expose a
+        # half-built rank through the persistent cache.
+        shards = list(cached) if cached is not None else [None, None]
+        for rank in missing:
+            shards[rank] = []
         for i in range(n_blocks):
             p = f"blocks.{i}."
             g = lambda k: f.get_tensor(p + k)
@@ -251,7 +268,8 @@ def _load_shards(path, n_blocks):
             small = {n: g(k).float() for n, k in (("norm1", "norm1.weight"), ("norm2", "norm2.weight"))}
             qn, kn = g("attn.q_norm.weight"), g("attn.k_norm.weight")
             inner, ffn = qkv.shape[0] // 3, fc1.shape[0] // 2
-            for rank, dev in enumerate(DEVICES):
+            for rank in missing:
+                dev = DEVICES[rank]
                 with torch.cuda.device(dev):
                     half_i, half_f = inner // 2, ffn // 2
                     shards[rank].append({
@@ -266,7 +284,8 @@ def _load_shards(path, n_blocks):
             if i % 10 == 0:
                 logger.info(f"[MultiGPU TP] sharded block {i}/{n_blocks}")
     _SHARD_CACHE[path] = shards
-    logger.info("[MultiGPU TP] %d blocks sharded over %s", n_blocks, ", ".join(map(str, DEVICES)))
+    logger.info('[MultiGPU TP] %d blocks ready over %s; loaded ranks %s in %.2f seconds',
+                n_blocks, ', '.join(map(str, DEVICES)), missing, time.perf_counter()-started)
     return shards
 
 
@@ -286,7 +305,7 @@ def _lora_factors(entries):
         w = adapter.weights if isinstance(adapter, comfy.weight_adapter.LoRAAdapter) else None
         if w is None or strength_model != 1.0 or offset is not None or function is not None or w[3] is not None or w[4] is not None:
             raise ValueError("H3 tensor parallel supports plain LoRA only (no LoCon mid, DoRA, LoHa/LoKr, offsets or model strength != 1)")
-        down, up = w[1].flatten(1).float(), w[0].flatten(1).float()
+        down, up = (v.flatten(1).to(device="cpu", dtype=torch.float32) for v in (w[1], w[0]))
         alpha = float(w[2]) / down.shape[0] if w[2] is not None else 1.0
         downs.append(down * (strength * alpha))
         ups.append(up)
@@ -320,13 +339,44 @@ def release_gpu(drop_shards=False):
         tp.release(drop_shards)
 
 
+def release_encoder_rank(device):
+    """Make room for Molmo on its GPU while retaining the other rank.
+
+    Used only outside sampling. Do not park ~9GB of weights in host RAM:
+    the encoder and base checkpoint already compete for Kaggle's host RAM.
+    The missing rank is reconstructed from the checkpoint at next sampling.
+    """
+    rank = DEVICES.index(torch.device(device))
+    released = 0
+    for tp in _INSTANCES.values():
+        if tp.shards is None or tp.shards[rank] is None:
+            continue
+        tp.release()  # drop exchange/LoRA scratch without dropping weights
+        tp.shards[rank] = None
+        cached = _SHARD_CACHE.get(tp.path)
+        if cached is not None:
+            cached[rank] = None
+        released += 1
+    with torch.cuda.device(DEVICES[rank]):
+        torch.cuda.synchronize(DEVICES[rank])
+        torch.cuda.empty_cache()
+    logger.info('[MultiGPU TP] released rank %d for encoder; retained other GPU rank (%d model instances)',rank,released)
+    return released
+
+
 class H3TensorParallel:
     def release(self, drop_shards=False):
         for d in DEVICES:
             torch.cuda.synchronize(d)
         self.xchg.bufs.clear()
-        if drop_shards and self.shards is not None:
+        # GPU LoRA copies belong to sampling, not the decoder or the next workflow.
+        self.lora = None
+        self.lora_mode = None
+        if drop_shards:
+            _SHARD_CACHE.pop(self.path, None)
             self.shards = None
+            self.lora_entries = {}
+            self.lora_sig = ()
             logger.warning("[MultiGPU TP] shards released to make room; the next sampling run re-shards them")
         for d in DEVICES:
             with torch.cuda.device(d):
@@ -343,9 +393,12 @@ class H3TensorParallel:
         self.checked = os.environ.get("MMH3_TP_CHECK", "0") != "1"
         self.prefetch_oom_n = float("inf")
         self.lora, self.lora_sig = None, ()
+        self.lora_entries = {}
+        self.lora_mode = None
+        self.lora_bytes = 0
 
     def set_lora(self, patches):
-        """Build the side paths for the LoRA patches on the block linears (called once per sampling run)."""
+        """Validate and retain adapters on the host; choose GPU residency once the token shape is known."""
         entries, ignored = {}, []
         for key, value in patches.items():
             parts = key.split(".")
@@ -356,30 +409,66 @@ class H3TensorParallel:
                 entries[(int(parts[2]), name)] = value
             elif not name.startswith("adaln_proj"):  # adaln_proj also runs on the patched original module
                 ignored.append(key)
-        sig = tuple(sorted((k, tuple((id(p[1]), p[0]) for p in v)) for k, v in entries.items()))
+        sig = tuple(sorted((k, tuple((id(p[1]), p[0], p[2], id(p[3]), id(p[4])) for p in v)) for k, v in entries.items()))
         if sig == self.lora_sig:
             return
         if ignored:
-            logger.warning("[MultiGPU TP] LoRA keys not applied under tensor parallel: %d (e.g. %s)", len(ignored), ignored[0])
+            raise ValueError("H3 tensor parallel cannot apply these block patches correctly: " + str(ignored[:5]))
         self.lora = None
-        if entries:
-            self.lora = [[{} for _ in self.blocks] for _ in DEVICES]
-            for (i, name), value in entries.items():
+        # Construct one block at a time. Avoid duplicating every CPU adapter or allocating every GPU side path
+        # before the base shards, activations and other workflow models have been accounted for.
+        by_block, nbytes = {}, 0
+        for (i, name), value in entries.items():
+            by_block.setdefault(i, {})[name] = value
+            for strength, adapter, strength_model, offset, function in value:
+                w = adapter.weights if isinstance(adapter, comfy.weight_adapter.LoRAAdapter) else None
+                if (w is None or strength_model != 1.0 or offset is not None or function is not None
+                        or w[3] is not None or w[4] is not None):
+                    raise ValueError("H3 tensor parallel supports plain LoRA only; unsupported patch must not be silently skipped")
+                up, down = w[0], w[1]
+                nbytes += (down.numel() + up.numel() // 2 if name in ("attn.qkv_proj", "mlp.fc1")
+                           else down.numel() // 2 + up.numel()) * 2
+        self.lora_entries, self.lora_bytes, self.lora_mode = by_block, nbytes, None
+        logger.info("[MultiGPU TP] LoRA: %d block linears, %.1f MiB per GPU if resident", len(entries), nbytes / 2**20)
+        self.lora_sig = sig
+
+    def _configure_lora(self, x):
+        if self.lora_mode is not None:
+            return
+        # Budget for both exchanges, residual/attention/QKV, chunked MLP work and allocator slack.
+        # This deliberately favours streaming high-rank/stacked adapters on 15-GB cards at 1MP.
+        reserve = (2 << 30) + x.shape[0] * x.shape[1] * 2 * 8
+        free = min(comfy.model_management.get_free_memory(d) for d in DEVICES)
+        self.lora_mode = ("resident" if free >= reserve + self.lora_bytes else "stream") if LORA_MODE == "auto" else LORA_MODE
+        self.lora = {}
+        logger.info("[MultiGPU TP] memory policy: %d tokens, QKV rows %d, LoRA %s (%.1f MiB/GPU; free %.2f GiB; activation budget %.2f GiB)",
+                    x.shape[0], QKV_ROWS, self.lora_mode, self.lora_bytes / 2**20, free / 2**30, reserve / 2**30)
+
+    def _block_lora(self, i):
+        entries = self.lora_entries.get(i)
+        if not entries:
+            return ({}, {})
+        if i not in self.lora:
+            if self.lora_mode == "stream":
+                self.lora.clear()
+            pair = ({}, {})
+            for name, value in entries.items():
                 down, up = _lora_factors(value)
                 for rank, dev in enumerate(DEVICES):
                     d, u = _shard_lora(name, down, up, rank)
-                    self.lora[rank][i][name] = (d.to(dev, torch.float16).contiguous(), u.to(dev, torch.float16).contiguous())
-            logger.info("[MultiGPU TP] LoRA side paths on %d block linears", len(entries))
-        self.lora_sig = sig
-
-    def _block_lora(self, i):
-        return ({}, {}) if self.lora is None else (self.lora[0][i], self.lora[1][i])
+                    pair[rank][name] = (d.to(dev, torch.float16).contiguous(), u.to(dev, torch.float16).contiguous())
+            self.lora[i] = pair
+        return self.lora[i]
 
     def _qkv(self, x, sh, shift, scale, segs, lora):
-        h = _norm_mod(x, sh["norm1"], self.eps1, shift, scale, segs)
-        out = _lin(h, sh["qkv"])
-        if "attn.qkv_proj" in lora:
-            out += _lora(h, lora["attn.qkv_proj"])
+        out = torch.empty((x.shape[0], 3 * sh["inner"]), dtype=torch.float16, device=x.device)
+        for a in range(0, x.shape[0], QKV_ROWS):
+            b = min(a + QKV_ROWS, x.shape[0])
+            h = _norm_mod(x[a:b], sh["norm1"], self.eps1, shift, scale, _chunk_segs(segs, a, b))
+            part = _lin(h, sh["qkv"])
+            if "attn.qkv_proj" in lora:
+                part += _lora(h, lora["attn.qkv_proj"])
+            out[a:b].copy_(part)
         return out
 
     def _attn(self, qkv, sh, rope, topts):
@@ -429,7 +518,7 @@ class H3TensorParallel:
 
     def block(self, i, args, original):
         d0, d1 = DEVICES
-        if self.shards is None:
+        if self.shards is None or any(rank is None for rank in self.shards):
             # permanent allocations: keep them out of the compiler's per-forward allocation graph
             with comfy.model_prefetch.pause_malloc_graph(sync=True):
                 self.shards = _load_shards(self.path, len(self.blocks))
@@ -440,6 +529,7 @@ class H3TensorParallel:
         st = self._step_state(args["img"], args)
         x1, segs0, segs1, topts = st["x1"], args["mod_segments"], st["segs1"], args["transformer_options"]
         sh0, sh1 = self.shards[0][i], self.shards[1][i]
+        self._configure_lora(x0)
         lo = self._block_lora(i)
         pre = st.pop("pre", None)
         if pre is not None and pre[0] == i:
@@ -485,7 +575,11 @@ class H3TensorParallel:
                 return self._mlp(xc, shs[r], mods[r][3], mods[r][4], csegs[j][r], lo[r])
             own_m.append(_per_rank(attn_then_mlp))
             sent_m.append(self.xchg.send("mlp", shape, (a, b), own_m[j]))
-        nxt = i + 1 if QKV_PREFETCH and i + 1 < len(self.blocks) and ref is None and n < self.prefetch_oom_n else None
+        # Prefetch is optional: leave room for two QKV buffers, chunk work and allocator slack before attempting it.
+        prefetch_need = 2 * n * 3 * sh0["inner"] * 2 + (512 << 20)
+        can_prefetch = (not self.lora_entries or self.lora_mode == "resident") and all(
+            comfy.model_management.get_free_memory(d) >= prefetch_need for d in DEVICES)
+        nxt = i + 1 if QKV_PREFETCH and can_prefetch and i + 1 < len(self.blocks) and ref is None and n < self.prefetch_oom_n else None
         if nxt is not None:
             nmods = self._mods(nxt, args["t_emb"])
             nsh = (self.shards[0][nxt], self.shards[1][nxt])
@@ -495,6 +589,7 @@ class H3TensorParallel:
             except torch.OutOfMemoryError:
                 # long sequences (~100k tokens): the extra qkv buffer does not fit next to this block's partials
                 self.prefetch_oom_n = n
+                nqkv = None
                 logger.info(f"[MultiGPU TP] qkv prefetch off for {n}+ tokens (out of memory)")
                 nxt = None
         for j, (a, b) in enumerate(chunks):
@@ -550,18 +645,25 @@ def _no_block_prefetch(executor, *args, **kwargs):
     topts = kwargs.get("transformer_options", args[3] if len(args) > 3 else None)
     if topts is not None:
         topts["prefetch_dynamic_vbars"] = False
-    if os.path.exists(PROFILE_FLAG):
-        return _profiled(executor, *args, **kwargs)
-    return executor(*args, **kwargs)
+    try:
+        if os.path.exists(PROFILE_FLAG):
+            return _profiled(executor, *args, **kwargs)
+        return executor(*args, **kwargs)
+    finally:
+        # Forward-local residual replicas and optional prefetch must not live in cached model_options.
+        if topts is not None:
+            topts.pop("_mmh3_tp", None)
 
 
 def _prepare_sampling(tp, executor, *args, **kwargs):
     # models loaded earlier in the session (e.g. SAM 3.1 in the face swap workflow) stay on cuda:0, and ComfyUI
     # does not count the shards and TP activations it never allocated; unload them before the sampler loads
-    comfy.model_management.free_memory(1e30, DEVICES[0])
-    # the guider's patcher carries any LoRA added after this loader (LoraLoaderModelOnly etc.)
-    tp.set_lora(executor.class_obj.model_patcher.patches)
     try:
+        # Text encoders and VAE helpers can be left on either card by preceding UI jobs.
+        for dev in DEVICES:
+            comfy.model_management.free_memory(1e30, dev)
+        # The guider's patcher carries LoRAs added after the loader, including stacked adapters.
+        tp.set_lora(executor.class_obj.model_patcher.patches)
         return executor(*args, **kwargs)
     finally:
         tp.release()  # ~0.6 GB of receive buffers per card and ~1.2 GB pinned host per token count
@@ -598,6 +700,9 @@ def attach(model, source, key):
     # the Comfy compiler records one device's allocations per forward; TP allocates on two.
     # ponytail: process-wide, Split in the same session runs without the compiler
     comfy.cli_args.args.disable_comfy_compiler = True
+    for other_key, other in _INSTANCES.items():
+        if other_key != key and (other.shards is not None or other.lora is not None):
+            other.release(drop_shards=True)
     tp = _INSTANCES.get(key)
     if tp is None:
         tp = _INSTANCES[key] = H3TensorParallel(source, dm)
