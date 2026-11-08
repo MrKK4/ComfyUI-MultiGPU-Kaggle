@@ -1,0 +1,20 @@
+{
+  "family": "h3",
+  "model": "MiniMax H3 DiT (Olivia DMAD-PDMD int8, 20.29 GB, 50 blocks, hidden 5376, 56 heads x 128, ffn 14336)",
+  "hardware": "Kaggle 2x Tesla T4 15360 MiB, PCIe via host bridge, no P2P, ComfyUI v0.44.2, torch 2.13.0+cu130",
+  "measured": {
+    "shards_gib_per_gpu": 8.98,
+    "idle_after_job_gib": {"gpu0": 11.27, "gpu1": 9.0},
+    "step_seconds_warm_18_9k_tokens": 23.4,
+    "step_seconds_warm_18_9k_tokens_exchange_off": 22.7,
+    "step_seconds_warm_40_7k_tokens": 54.5,
+    "peak_gib_18_9k": [12.6, 12.9],
+    "peak_gib_40_7k": [14.3, 13.7],
+    "cold_job_seconds_no_decode_2_steps": 205,
+    "int8_tops_achieved": [30, 40],
+    "attention_efficient_tflops": 12.3,
+    "gpu_clock_mhz_busy_mean": [671, 799],
+    "pcie_gbps": {"h2d": 12.1, "d2h": 13.0, "gpu_to_gpu": 11.5, "both_d2h_aggregate": 26.0}
+  },
+  "notes": "tokens = latent_t x (H/32) x (W/32), latent_t = ((frames-5)//17)*5+2 with frames aligned to n%17==5. Measured 2026-11-09 with portkit-style runs (tests/h3_upscale m0, m1)."
+}
