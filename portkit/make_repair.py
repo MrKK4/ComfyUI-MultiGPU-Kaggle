@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--probe-dir")
     ap.add_argument("--attempt", type=int, default=2)
     ap.add_argument("--extra-log")
+    ap.add_argument("--task-prompt", help="original port prompt, including model-specific instructions")
     ap.add_argument("--out", default=".")
     ap.add_argument("--budget", type=int, default=120000)
     a = ap.parse_args()
@@ -54,12 +55,16 @@ def main():
     parts = {
         "ROLE": ROLE,
         "CONTEXT": CONTINUATION.format(prev=a.attempt - 1),
-        "THE TASK AS IT WAS ASKED": read(ROOT / "docs" / "PORTING.md"),
+        "THE TASK AS IT WAS ASKED": read(a.task_prompt) if a.task_prompt else read(ROOT / "docs" / "PORTING.md"),
         "THE MODULE YOU WROTE (attempt %d), as we ran it" % (a.attempt - 1): read(a.code),
         "WHAT WE MEASURED (verify report from Kaggle, 2x T4)": read(a.verify_report),
     }
     if a.probe_dir and (pathlib.Path(a.probe_dir) / "PROBE_REPORT.md").exists():
         parts["MODEL FACTS (probe report)"] = read(pathlib.Path(a.probe_dir) / "PROBE_REPORT.md")
+        for filename in ("probe.json", "block_source.txt"):
+            path = pathlib.Path(a.probe_dir) / filename
+            if path.exists():
+                parts["DEEP PROBE: " + filename] = read(path)
     if a.extra_log:
         parts["EXTRA LOG LINES"] = trim(read(a.extra_log), 20000)
     parts["THE PROBLEM"] = "Class: %s.\nSymptom: %s\n\n%s" % (a.problem, a.symptom, GUIDE[a.problem])

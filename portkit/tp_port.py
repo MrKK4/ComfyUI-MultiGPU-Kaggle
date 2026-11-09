@@ -32,6 +32,7 @@ def main():
     p.add_argument("--code", required=True); p.add_argument("--verify-report", required=True)
     p.add_argument("--problem", default="other"); p.add_argument("--symptom", required=True); p.add_argument("--attempt", default="2")
     p.add_argument("--probe-dir"); p.add_argument("--extra-log"); p.add_argument("--budget", default="120000")
+    p.add_argument("--task-prompt")
     sub.add_parser("runs")
     a = ap.parse_args()
     if a.cmd == "runs":
@@ -47,6 +48,9 @@ def main():
             "--notes", a.notes, "--budget", a.budget)
     else:
         extra = (["--probe-dir", a.probe_dir] if a.probe_dir else (["--probe-dir", str(base / "probe")] if (base / "probe").exists() else [])) + (["--extra-log", a.extra_log] if a.extra_log else [])
+        original = pathlib.Path(a.task_prompt) if a.task_prompt else base / ("port_%s_prompt.txt" % a.name)
+        if original.exists():
+            extra += ["--task-prompt", str(original)]
         run("make_repair.py", "--name", a.name, "--reference", a.reference, "--code", a.code, "--verify-report", a.verify_report, "--problem", a.problem,
             "--symptom", a.symptom, "--attempt", a.attempt, "--out", base / ("attempt_" + a.attempt), "--budget", a.budget, *extra)
 
