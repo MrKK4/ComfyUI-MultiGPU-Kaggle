@@ -4,17 +4,80 @@
   "hardware": "Kaggle 2x Tesla T4 15360 MiB, PCIe via host bridge, no P2P, ComfyUI v0.44.2, torch 2.13.0+cu130",
   "measured": {
     "shards_gib_per_gpu": 8.98,
-    "idle_after_job_gib": {"gpu0": 11.27, "gpu1": 9.0},
+    "idle_after_job_gib": {
+      "gpu0": 11.27,
+      "gpu1": 9.0
+    },
     "step_seconds_warm_18_9k_tokens": 23.4,
     "step_seconds_warm_18_9k_tokens_exchange_off": 22.7,
     "step_seconds_warm_40_7k_tokens": 54.5,
-    "peak_gib_18_9k": [12.6, 12.9],
-    "peak_gib_40_7k": [14.3, 13.7],
+    "peak_gib_18_9k": [
+      12.6,
+      12.9
+    ],
+    "peak_gib_40_7k": [
+      14.3,
+      13.7
+    ],
     "cold_job_seconds_no_decode_2_steps": 205,
-    "int8_tops_achieved": [30, 40],
+    "int8_tops_achieved": [
+      30,
+      40
+    ],
     "attention_efficient_tflops": 12.3,
-    "gpu_clock_mhz_busy_mean": [671, 799],
-    "pcie_gbps": {"h2d": 12.1, "d2h": 13.0, "gpu_to_gpu": 11.5, "both_d2h_aggregate": 26.0}
+    "gpu_clock_mhz_busy_mean": [
+      671,
+      799
+    ],
+    "pcie_gbps": {
+      "h2d": 12.1,
+      "d2h": 13.0,
+      "gpu_to_gpu": 11.5,
+      "both_d2h_aggregate": 26.0
+    }
   },
-  "notes": "tokens = latent_t x (H/32) x (W/32), latent_t = ((frames-5)//17)*5+2 with frames aligned to n%17==5. Measured 2026-11-09 with portkit-style runs (tests/h3_upscale m0, m1)."
+  "notes": "tokens = latent_t x (H/32) x (W/32), latent_t = ((frames-5)//17)*5+2 with frames aligned to n%17==5. Measured 2026-11-09 with portkit-style runs (tests/h3_upscale m0, m1).",
+  "verification": {
+    "kernel": "safd7sd4/h3-kit-verify",
+    "script_version_id": 367055450,
+    "report_verdict": "PASS",
+    "tokens": 19331,
+    "block0_rel_err": 0.002759,
+    "replica_drift": 0.0,
+    "warm_on_step_seconds": [
+      23.29,
+      22.76
+    ],
+    "warm_on_mean_step_seconds": 23.025,
+    "exchange_off_step_seconds": 22.1,
+    "exchange_share_percent": 4.02,
+    "cold_job_seconds": 291.4,
+    "cold_progress_gap_mean_seconds": 20.48,
+    "cold_shard_load_seconds": 76.48,
+    "peak_gib_cold": [
+      13.23,
+      12.08
+    ],
+    "peak_gib_warm": [
+      12.26,
+      12.27
+    ],
+    "release_allocated_gib_before": [
+      11.27,
+      8.99
+    ],
+    "release_allocated_gib_after": [
+      2.29,
+      0.01
+    ],
+    "reload_job_seconds": 239.4,
+    "reload_shard_load_seconds": 75.34,
+    "reload_step_seconds": 22.7,
+    "limitations": [
+      "Step times are means of two progress gaps; cold initialization is excluded from these gaps. Job times include graph work beyond sampling.",
+      "Exchange A/B uses different seeds and only two gaps per job; 4% is an estimate.",
+      "Harness does not establish calibrated int8 baseline error, full-forward correlation, single-GPU speedup, or unsupported-model fallback. Block comparison is only block0 on one input.",
+      "Legacy measured section retains earlier measurements at their original token counts."
+    ]
+  }
 }

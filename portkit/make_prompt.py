@@ -57,6 +57,7 @@ def build(name, reference, probe_dir, budget, notes):
     report = read(pathlib.Path(probe_dir) / "PROBE_REPORT.md")
     bs = pathlib.Path(probe_dir) / "block_source.txt"
     blocksrc = read(bs) if bs.exists() else "(no source text: the probe was run without --deep; reason from the report and your knowledge of the architecture)"
+    probe_json = pathlib.Path(probe_dir) / "probe.json"
     parts = {
         "ROLE": ROLE,
         "TASK": "Port the diffusion transformer described under PROBE DATA to two-GPU tensor parallel (Kaggle, 2x Tesla T4, no peer-to-peer) by writing `%s_tensor_parallel.py`, "
@@ -66,6 +67,7 @@ def build(name, reference, probe_dir, budget, notes):
         "WEIGHT SOURCE INTERFACE (tp_source.ModelWeights)": modelweights_excerpt(),
         "REFERENCE MODULE: " + REFERENCES[reference]: ref,
         "PROBE DATA": report,
+        "STRUCTURED PROBE DATA (probe.json)": read(probe_json) if probe_json.exists() else "(not available)",
         "MODEL SOURCE CODE (from ComfyUI)": blocksrc,
         "OUTPUT": OUTPUT.format(name=name),
     }
