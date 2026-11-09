@@ -1,0 +1,338 @@
+{
+  "family": "idol",
+  "model": "Comfy-Org/Idol idol_fp16.safetensors",
+  "model_bytes": 741106994,
+  "hardware": "Kaggle 2x Tesla T4; shared setup selects latest ComfyUI release",
+  "scope": "Direct denoiser, synthetic latent [1,8192,16], camera [1,1,5], context [1,64,1280], t=0.5, no ref_latents; 8257 tokens in the main blocks. No encoders, decoder, sampler hook, LoRA or production workflow validation.",
+  "initial_kernel": "safd7sd4/idol-kit-verify",
+  "repair_kernel": "safd7sd4/idol-kit-repair-verify",
+  "source_sha256": "d83e4762522f920723cd11eb32dd9346fead7b7e28c1d0ebcad3baff03ea5e55",
+  "initial": {
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "supports target",
+        "status": "PASS",
+        "detail": "LatentSeqMMFlowModel"
+      },
+      {
+        "name": "rejects other models",
+        "status": "PASS",
+        "detail": null
+      },
+      {
+        "name": "automatic attach",
+        "status": "PASS",
+        "detail": null
+      },
+      {
+        "name": "full forward seed 1",
+        "status": "PASS",
+        "detail": {
+          "finite": true,
+          "cosine": 0.9998368620872498,
+          "rel_err": 0.017757881432771683
+        }
+      },
+      {
+        "name": "full forward seed 2",
+        "status": "PASS",
+        "detail": {
+          "finite": true,
+          "cosine": 0.999839723110199,
+          "rel_err": 0.017637694254517555
+        }
+      },
+      {
+        "name": "full forward seed 3",
+        "status": "PASS",
+        "detail": {
+          "finite": true,
+          "cosine": 0.9998395442962646,
+          "rel_err": 0.017622485756874084
+        }
+      },
+      {
+        "name": "memory margin",
+        "status": "PASS",
+        "detail": [
+          1.1981887817382812,
+          0.33568572998046875
+        ]
+      },
+      {
+        "name": "deliberately broken port is rejected",
+        "status": "PASS",
+        "detail": {
+          "cosine": -0.4477924704551697,
+          "verifier_verdict": "FAIL",
+          "seconds": 0.840978328999995
+        }
+      },
+      {
+        "name": "release under 3 GiB",
+        "status": "PASS",
+        "detail": [
+          0.7332925796508789,
+          0.00390625
+        ]
+      },
+      {
+        "name": "reload reproduces output",
+        "status": "PASS",
+        "detail": 1.0659740050000437
+      }
+    ],
+    "measurements": {
+      "single_gpu_seconds": [
+        1.3296682769999961,
+        0.9837888989999897,
+        0.983322429999987
+      ],
+      "tp_seconds": [
+        1.3450177660000122,
+        1.0149540610000258,
+        1.0301872259999527
+      ],
+      "peak_allocated_gib": [
+        1.1981887817382812,
+        0.33568572998046875
+      ],
+      "deliberate_exchange_off": {
+        "cosine": -0.4477924704551697,
+        "verifier_verdict": "FAIL",
+        "seconds": 0.840978328999995
+      },
+      "after_release_allocated_gib": [
+        0.7332925796508789,
+        0.00390625
+      ],
+      "speed_note": "Compare warm timings only. A slower port requires an explicit fallback decision; no speed acceptance is inferred."
+    },
+    "scope": "Direct denoiser outputs, synthetic inputs; image encoders, decoder, sampler hooks and production workflows are not exercised."
+  },
+  "deliberately_broken": {
+    "verdict": "FAIL",
+    "checks": [
+      {
+        "name": "supports target",
+        "status": "PASS",
+        "detail": "LatentSeqMMFlowModel"
+      },
+      {
+        "name": "rejects other models",
+        "status": "PASS",
+        "detail": null
+      },
+      {
+        "name": "automatic attach",
+        "status": "PASS",
+        "detail": null
+      },
+      {
+        "name": "full forward seed 1",
+        "status": "FAIL",
+        "detail": {
+          "finite": true,
+          "cosine": -0.4477924704551697,
+          "rel_err": 2.001352548599243
+        }
+      },
+      {
+        "name": "full forward seed 2",
+        "status": "FAIL",
+        "detail": {
+          "finite": true,
+          "cosine": -0.4474090337753296,
+          "rel_err": 1.9870169162750244
+        }
+      },
+      {
+        "name": "full forward seed 3",
+        "status": "FAIL",
+        "detail": {
+          "finite": true,
+          "cosine": -0.4454461932182312,
+          "rel_err": 1.9864752292633057
+        }
+      },
+      {
+        "name": "memory margin",
+        "status": "PASS",
+        "detail": [
+          1.1824707984924316,
+          0.31996774673461914
+        ]
+      },
+      {
+        "name": "deliberately broken port is rejected",
+        "status": "PASS",
+        "detail": {
+          "cosine": -0.4477924704551697,
+          "verifier_verdict": "FAIL",
+          "seconds": 0.8162092960000109
+        }
+      },
+      {
+        "name": "release under 3 GiB",
+        "status": "PASS",
+        "detail": [
+          0.7332925796508789,
+          0.00390625
+        ]
+      },
+      {
+        "name": "reload reproduces output",
+        "status": "FAIL",
+        "detail": 0.8527003379999769
+      }
+    ],
+    "measurements": {
+      "single_gpu_seconds": [
+        1.2384972810000363,
+        1.0054016330000195,
+        1.0101949439999771
+      ],
+      "tp_seconds": [
+        1.017575813999997,
+        0.8163449730000139,
+        0.8158660310000414
+      ],
+      "peak_allocated_gib": [
+        1.1824707984924316,
+        0.31996774673461914
+      ],
+      "deliberate_exchange_off": {
+        "cosine": -0.4477924704551697,
+        "verifier_verdict": "FAIL",
+        "seconds": 0.8162092960000109
+      },
+      "after_release_allocated_gib": [
+        0.7332925796508789,
+        0.00390625
+      ],
+      "speed_note": "Compare warm timings only. A slower port requires an explicit fallback decision; no speed acceptance is inferred."
+    },
+    "scope": "Direct denoiser outputs, synthetic inputs; image encoders, decoder, sampler hooks and production workflows are not exercised."
+  },
+  "repaired": {
+    "verdict": "PASS",
+    "checks": [
+      {
+        "name": "supports target",
+        "status": "PASS",
+        "detail": "LatentSeqMMFlowModel"
+      },
+      {
+        "name": "rejects other models",
+        "status": "PASS",
+        "detail": null
+      },
+      {
+        "name": "automatic attach",
+        "status": "PASS",
+        "detail": null
+      },
+      {
+        "name": "full forward seed 1",
+        "status": "PASS",
+        "detail": {
+          "finite": true,
+          "cosine": 0.9998368620872498,
+          "rel_err": 0.017757881432771683
+        }
+      },
+      {
+        "name": "full forward seed 2",
+        "status": "PASS",
+        "detail": {
+          "finite": true,
+          "cosine": 0.999839723110199,
+          "rel_err": 0.017637694254517555
+        }
+      },
+      {
+        "name": "full forward seed 3",
+        "status": "PASS",
+        "detail": {
+          "finite": true,
+          "cosine": 0.9998395442962646,
+          "rel_err": 0.017622485756874084
+        }
+      },
+      {
+        "name": "memory margin",
+        "status": "PASS",
+        "detail": [
+          1.1981887817382812,
+          0.33568572998046875
+        ]
+      },
+      {
+        "name": "deliberately broken port is rejected",
+        "status": "PASS",
+        "detail": {
+          "cosine": -0.4477924704551697,
+          "verifier_verdict": "FAIL",
+          "seconds": 0.8531400740000095
+        }
+      },
+      {
+        "name": "release under 3 GiB",
+        "status": "PASS",
+        "detail": [
+          0.7332925796508789,
+          0.00390625
+        ]
+      },
+      {
+        "name": "reload reproduces output",
+        "status": "PASS",
+        "detail": 1.0673670870000365
+      }
+    ],
+    "measurements": {
+      "single_gpu_seconds": [
+        1.329297605000022,
+        0.9984143760000279,
+        1.0009700310000085
+      ],
+      "tp_seconds": [
+        1.3657839350000245,
+        1.0276531439999985,
+        1.0266956279999704
+      ],
+      "peak_allocated_gib": [
+        1.1981887817382812,
+        0.33568572998046875
+      ],
+      "deliberate_exchange_off": {
+        "cosine": -0.4477924704551697,
+        "verifier_verdict": "FAIL",
+        "seconds": 0.8531400740000095
+      },
+      "after_release_allocated_gib": [
+        0.7332925796508789,
+        0.00390625
+      ],
+      "speed_note": "Compare warm timings only. A slower port requires an explicit fallback decision; no speed acceptance is inferred."
+    },
+    "scope": "Direct denoiser outputs, synthetic inputs; image encoders, decoder, sampler hooks and production workflows are not exercised."
+  },
+  "block0_initial": {
+    "rel_err": 0.001830097,
+    "drift": 0.0,
+    "finite": true
+  },
+  "prompt_input_tokens_actual": {
+    "port": 30879,
+    "repair": 73293
+  },
+  "speed_decision": {
+    "warm_single_gpu_seconds": 0.9835556644999883,
+    "warm_tp_seconds": 1.0225706434999893,
+    "tp_slowdown_percent": 3.9667281078427985,
+    "accepted_fallback": "Intentionally leave Idol out of tp_auto.MODULES. Keep the generated module as a tested example; production sampling continues on one GPU. No optimisation runs requested."
+  },
+  "repair_hosting_note": "Repair task v2 returned a complete fresh Opus response (assistant sender anthropic/claude-opus-5-5@default), but Kaggle administratively rejected the task for hardcoded model selection. The returned code was recovered and independently verified on GPU. Committed task builders retain kbench.llm; select hosted models with the CLI."
+}

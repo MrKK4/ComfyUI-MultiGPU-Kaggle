@@ -11,7 +11,7 @@ import re
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REFERENCES = {"h3": "h3_tensor_parallel.py", "qwen21": "qwen21_tensor_parallel.py", "krea2": "krea2_tensor_parallel.py", "ltx": "ltx_tensor_parallel.py"}
-CHARS_PER_TOKEN = 3.4   # code-heavy text, deliberately pessimistic
+CHARS_PER_TOKEN = 2.0   # conservative vs measured Idol port/repair: about 2.3 chars per input token
 
 ROLE = """You are a senior PyTorch / CUDA engineer who writes tensor-parallel inference code for ComfyUI diffusion transformers.
 You have no internet access and no memory of earlier conversations: everything you need is in this message. Answer from this message and your own knowledge.
