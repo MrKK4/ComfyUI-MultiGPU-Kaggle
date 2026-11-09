@@ -9,7 +9,7 @@ RES = "/kaggle/working/h3_up/tpprobe.json"
 
 
 def _tp_modules():
-    return [m for k, m in list(sys.modules.items()) if k.endswith("_tensor_parallel") and hasattr(m, "_INSTANCES")]
+    return [m for k, m in list(sys.modules.items()) if k.endswith("_tensor_parallel") and hasattr(m, "_INSTANCES") and bool(m._INSTANCES)]
 
 
 def _mem():

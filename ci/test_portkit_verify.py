@@ -3,6 +3,7 @@
 These tests validate report decisions, not GPU port correctness.
 """
 import builtins
+import ast
 import io
 import json
 import pathlib
@@ -42,7 +43,7 @@ def verify(fault=None):
             logs.append('[FiniteCheck] non-finite values: %d' % (1 if fault == 'finite' else 0))
             # The VAE stream is deliberately slower: it must never stand in for sampler ticks.
             for value in (1, 2, 3):
-                clock[0] += 22.1 if name == 'V3_warm_exchange_off' else 23.0
+                clock[0] += (0.2 if name == 'V3_warm_exchange_off' else 0.21) if fault == 'fast_sampler' else (22.1 if name == 'V3_warm_exchange_off' else 23.0)
                 node = 'decode' if fault == 'vae_only' else 'sample'
                 events.append((clock[0], {'type': 'progress', 'data': {'node': node, 'max': 3, 'value': value}}))
                 samples.append((clock[0], None, None, None, [[14.5 * 1024 if fault == 'peak' else 12 * 1024], [12 * 1024]]))
@@ -82,6 +83,22 @@ class VerifyDecisions(unittest.TestCase):
         report = verify('vae_only')
         self.assertTrue(report.startswith('# VERIFY_REPORT: INCOMPLETE'))
         self.assertIn('**exchange share**: UNKNOWN', report)
+
+    def test_fast_sampler_timings_are_valid(self):
+        self.assertTrue(verify('fast_sampler').startswith('# VERIFY_REPORT: PASS'))
+
+    def test_switch_ignores_imported_inactive_modules(self):
+        head = ast.parse((SOURCE.parent / 'verify_head.py').read_text())
+        assignment = next(n for n in head.body if isinstance(n, ast.Assign) and
+                          isinstance(n.targets[0], ast.Subscript) and
+                          isinstance(n.targets[0].value, ast.Name) and n.targets[0].value.id == "EXTRA_NODES")
+        node_code = ast.parse(ast.literal_eval(assignment.value))
+        function = next(n for n in node_code.body if isinstance(n, ast.FunctionDef) and n.name == '_tp_modules')
+        active = types.SimpleNamespace(_INSTANCES={'model': object()})
+        inactive = types.SimpleNamespace(_INSTANCES={})
+        ns = {'sys': types.SimpleNamespace(modules={'a_tensor_parallel': active, 'b_tensor_parallel': inactive})}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), 'switch', 'exec'), ns)
+        self.assertEqual(ns['_tp_modules'](), [active])
 
 
 if __name__ == '__main__':

@@ -24,7 +24,7 @@ def seeded(g, seed):
 def step_stats(t0, t1):
     ticks = {}
     for t, m in EVENTS:
-        if t0 <= t <= t1 and m.get('type') == 'progress':
+        if t0 < t <= t1 and m.get('type') == 'progress':
             d = m['data']; ticks.setdefault((d.get('node'), d.get('max')), []).append((t, d.get('value')))
     if not ticks:
         return None
@@ -94,7 +94,7 @@ for state, names in switch_logs:
 switch_ok = (all(SWITCH_RESULTS.get(state) is True for state in (True, False))
              and bool(switched.get('True')) and switched.get('True') == switched.get('False'))
 c('exchange switch reached modules', switch_ok, {'jobs': SWITCH_RESULTS, 'modules': switched})
-if switch_ok and len(on) == 2 and off and off.get('median_s') and min(on + [off['median_s']]) >= 1.0:   # sub-second gaps = wrong progress stream, do not trust
+if switch_ok and len(on) == 2 and off and off.get('median_s') and min(on + [off['median_s']]) > 0.0:   # fast models are valid once the sampler identity is established
     share = (sum(on) / len(on) - off['median_s']) / (sum(on) / len(on))
     c('exchange share of a step <= %d%%' % int(LIM['exchange_share'] * 100), share <= LIM['exchange_share'], 'on %.1f s, off %.1f s, share %.1f%%' % (sum(on) / len(on), off['median_s'], share * 100))
 else:
