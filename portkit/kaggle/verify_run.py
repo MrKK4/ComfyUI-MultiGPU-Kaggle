@@ -1,5 +1,6 @@
 # Kit verify, part 2: runs the target graph cold / warm / exchange off / after a release, checks the module and writes VERIFY_REPORT.md.
 # Thresholds can be overridden by the builder (KIT_LIMITS dict).
+import ast
 import copy
 
 LIM = dict(rel_err=3e-2, margin_gib=1.0, exchange_share=0.15, release_gib=3.0)
@@ -27,8 +28,10 @@ def step_stats(t0, t1):
             d = m['data']; ticks.setdefault((d.get('node'), d.get('max')), []).append((t, d.get('value')))
     if not ticks:
         return None
-    own = [k for k in ticks if k[0] in SAMPLER_IDS] or sorted(ticks, key=lambda k: k[1] or 0)[:1]   # sampler steps only (not VAE-decode tiles)
-    key = max(own, key=lambda k: k[1] or 0)
+    own = [k for k in ticks if k[0] in SAMPLER_IDS]
+    if len(own) != 1:   # missing or ambiguous sampler stream is not timing evidence
+        return None
+    key = own[0]
     ts = [t for t, _ in ticks[key]]
     gaps = [b - a for a, b in zip(ts, ts[1:])]
     return {'steps': key[1], 'gaps_s': [round(x, 1) for x in gaps], 'median_s': round(sum(gaps) / len(gaps), 2) if gaps else None}
@@ -40,6 +43,7 @@ def peak(t0, t1):
 
 
 RESULTS = {}
+SWITCH_RESULTS = {}
 
 
 def job(name, graph):
@@ -50,7 +54,7 @@ def job(name, graph):
 
 
 def switch(off):
-    run('switch_off=%s' % off, {'sw': {'class_type': 'TPSwitch', 'inputs': {'exchange_off': off}}})
+    SWITCH_RESULTS[off] = run('switch_off=%s' % off, {'sw': {'class_type': 'TPSwitch', 'inputs': {'exchange_off': off}}})
 
 
 job('V1_cold', seeded(g0, 1))
@@ -80,7 +84,17 @@ c('block check rel_err', (max(float(x[1]) for x in checks) <= LIM['rel_err']) if
 c('finite outputs', (not any(nonfinite) and all(x[3] == 'True' for x in checks)) if nonfinite else None, {'FiniteCheck': nonfinite})
 pk = [RESULTS[k]['peak_gib'] for k in RESULTS if RESULTS[k].get('peak_gib')]
 c('memory margin (peak <= 14.56 - %.1f GiB)' % LIM['margin_gib'], (max(max(p) for p in pk) <= 14.56 - LIM['margin_gib']) if pk else None, {k: r['peak_gib'] for k, r in RESULTS.items()})
-if on and off and off.get('median_s') and min(on) >= 1.0:   # sub-second gaps = wrong progress stream, do not trust
+switch_logs = re.findall(r'\[TPSwitch\] exchange_off = (True|False) modules (\[[^\n]*\])', text)
+switched = {}
+for state, names in switch_logs:
+    try:
+        switched[state] = ast.literal_eval(names)
+    except (ValueError, SyntaxError):
+        pass
+switch_ok = (all(SWITCH_RESULTS.get(state) is True for state in (True, False))
+             and bool(switched.get('True')) and switched.get('True') == switched.get('False'))
+c('exchange switch reached modules', switch_ok, {'jobs': SWITCH_RESULTS, 'modules': switched})
+if switch_ok and len(on) == 2 and off and off.get('median_s') and min(on + [off['median_s']]) >= 1.0:   # sub-second gaps = wrong progress stream, do not trust
     share = (sum(on) / len(on) - off['median_s']) / (sum(on) / len(on))
     c('exchange share of a step <= %d%%' % int(LIM['exchange_share'] * 100), share <= LIM['exchange_share'], 'on %.1f s, off %.1f s, share %.1f%%' % (sum(on) / len(on), off['median_s'], share * 100))
 else:
