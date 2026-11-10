@@ -24,6 +24,26 @@ A module `<family>_tensor_parallel.py` must provide:
 
 Existing references: `h3_tensor_parallel.py` (MiniMax H3, int8 convrot, the best tested), `qwen21_tensor_parallel.py`, `krea2_tensor_parallel.py`, `ltx_tensor_parallel.py`, `trellis2_dual_attention.py` (attention-only). Variants live next to the base by suffix; plug-ins live in their own folder (`veda/` is a sparse-attention plug-in chosen through the attention backend option, not a copy of the TP file).
 
+### Experimental H3 pre-split file loading
+
+`h3_piece_loader.py` reads layout-v1 safetensors pieces created by `portkit/h3_pieces.py`. It is off by default and applies only to file-backed H3 TP sources, including `UNETLoaderH3TensorParallel`; automatic `ModelWeights` sources keep the existing builder. The original checkpoint remains necessary for the non-block layers.
+
+To opt in, set all three variables before starting ComfyUI:
+
+- `MMH3_TP_PIECES=1`
+- `MMH3_TP_PIECES_DIR=/path/to/the/folder/containing/manifest.json`
+- `MMH3_TP_PIECES_MANIFEST_SHA256=<trusted SHA-256 of manifest.json>`
+
+Download the files separately into a runtime directory such as `/kaggle/temp`; the inference loader does not access the network. Use real files (for example Hugging Face's `local_dir` download), not snapshot symlinks. Keep the source and piece revisions pinned.
+
+Before allocation, the loader checks the pinned manifest, source header, full source SHA-256, shapes, dtypes, scalar metadata, and complete per-rank block coverage. The full source digest is reused only while its resolved file identity/stat fingerprint stays unchanged. Each piece is read and hashed once into a bounded buffer before transfer. At most one piece per missing rank is pinned concurrently; PyTorch may cache those host allocations after the buffers are released.
+
+File-backed restoration runs after managed-model cleanup and before sampling. Resident ranks are retained, and newly loaded ranks are published only after every worker completes. A file-validation failure logs a rejection and rebuilds from the original checkpoint. Memory refusal and CUDA errors propagate rather than triggering a potentially unsafe retry. Unexpected missing ranks during a forward are refused when pieces are enabled.
+
+Rank workers preserve the caller's PyTorch inference mode. This context is thread-local: creating ordinary tensors in a worker while the original builder creates inference tensors changes Dynamo guards for the compiled norm kernels. Cache exhaustion can then silently change the arithmetic path. The loader regression checks both inference-mode settings and retained-rank restoration.
+
+This stage supports loading and whole-rank restoration. Selective block eviction and automatic preprocessor/VAE memory-demand integration are not implemented by this loader. Weight layout compatibility is controlled by the explicit layout version, not by comparing the current wrapper's source-code hash with the exporter's historical reference hash.
+
 ## 3. The standard recipe for a transformer block
 
 Megatron-style, two ranks, one process (rank r runs on `cuda:r`):

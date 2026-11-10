@@ -248,6 +248,19 @@ def _load_shards(path, n_blocks):
         logger.info('[MultiGPU TP] reusing both resident shard ranks')
         return cached
     missing = [rank for rank in range(len(DEVICES)) if cached is None or cached[rank] is None]
+    if isinstance(path, str) and os.environ.get('MMH3_TP_PIECES', '0') == '1':
+        from .h3_piece_loader import PieceFileError, restore_ranks
+        failure = None
+        try:
+            shards = restore_ranks(path, n_blocks, os.environ.get('MMH3_TP_PIECES_DIR', ''),
+                os.environ.get('MMH3_TP_PIECES_MANIFEST_SHA256', ''), cached, DEVICES,
+                comfy.model_management.free_memory, comfy.model_management.get_free_memory)
+        except PieceFileError as error:
+            failure = str(error)
+        if failure is None:
+            _SHARD_CACHE[path] = shards
+            return shards
+        logger.warning('[TP-PIECES] rejected: %s; rebuilding from original source', failure)
     started = time.perf_counter()
     logger.info('[MultiGPU TP] loading shard ranks %s; retained ranks %s', missing,
                 [rank for rank in range(len(DEVICES)) if rank not in missing])
@@ -526,6 +539,8 @@ class H3TensorParallel:
     def block(self, i, args, original):
         d0, d1 = DEVICES
         if self.shards is None or any(rank is None for rank in self.shards):
+            if os.environ.get('MMH3_TP_PIECES', '0') == '1' and isinstance(self.path, str):
+                raise RuntimeError('H3 shards missing during forward; expected pre-sampling preload')
             # permanent allocations: keep them out of the compiler's per-forward allocation graph
             with comfy.model_prefetch.pause_malloc_graph(sync=True):
                 self.shards = _load_shards(self.path, len(self.blocks))
@@ -670,6 +685,10 @@ def _prepare_sampling(tp, executor, *args, **kwargs):
         # Text encoders and VAE helpers can be left on either card by preceding UI jobs.
         for dev in DEVICES:
             comfy.model_management.free_memory(1e30, dev)
+        if (os.environ.get('MMH3_TP_PIECES', '0') == '1' and isinstance(tp.path, str)
+                and (tp.shards is None or any(rank is None for rank in tp.shards))):
+            with comfy.model_prefetch.pause_malloc_graph(sync=True):
+                tp.shards = _load_shards(tp.path, len(tp.blocks))
         # The guider's patcher carries LoRAs added after the loader, including stacked adapters.
         tp.set_lora(executor.class_obj.model_patcher.patches)
         return executor(*args, **kwargs)
