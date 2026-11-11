@@ -29,7 +29,8 @@ class AutoBundleTests(unittest.TestCase):
         package = module('h3_auto_fixture')
         package.__path__ = [str(ROOT)]
         source = module(package.__name__ + '.h3_bundle_source')
-        source.H3BundleSource = type('H3BundleSource', (), {})
+        source.H3BundleSource = type('H3BundleSource', (), {
+            '__init__': lambda self, *args: setattr(self, 'args', args)})
         loader = module(package.__name__ + '.h3_bundle_loader')
         loader.load_h3_bundle = lambda *args: ('bundle', args)
         parallel = module(package.__name__ + '.h3_tensor_parallel')
@@ -65,6 +66,11 @@ class AutoBundleTests(unittest.TestCase):
                'MMH3_TP_BUNDLE_ALIASES': 'PRISM_DMAD_PDMD_int8.safetensors|Olivia_H3.safetensors'}
         with patch.dict(os.environ, env), patch.object(torch.cuda, 'device_count', return_value=2):
             self.assertTrue(self.auto.install())
+            router = self.nodes.UNETLoader.load_unet.__mmh3_bundle_router__
+            self.assertTrue(router.is_routed('PRISM_DMAD_PDMD_int8.safetensors'))
+            self.assertFalse(router.is_routed('plain.safetensors'))
+            self.assertEqual(router.bundle_key('PRISM_DMAD_PDMD_int8.safetensors').args,
+                             ('bundle', 'pieces', 'a' * 64))
             self.assertIn('PRISM_DMAD_PDMD_int8.safetensors', self.paths.get_filename_list('diffusion_models'))
             self.assertEqual(self.nodes.UNETLoader().load_unet('PRISM_DMAD_PDMD_int8.safetensors', 'default')[0][0], 'bundle')
             self.assertEqual(self.parallel.UNETLoaderH3TensorParallel().load('Olivia_H3.safetensors')[0][0], 'bundle')

@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+from types import SimpleNamespace
 
 import torch
 
@@ -71,6 +72,12 @@ def install():
             raise ValueError('H3 split bundle uses its pinned int8 dtype; set weight_dtype to default')
         logger.info('[TP-BUNDLE-AUTO] %s -> Olivia split bundle', unet_name)
         return (load_h3_bundle(*_bundle_args()),)
+    # Comfy Remote wraps this loader later. Give it the actual routing predicate
+    # and bundle identity so it can preserve only this bundle's warm shards.
+    load_unet.__mmh3_bundle_router__ = SimpleNamespace(
+        is_routed=_is_h3_name,
+        bundle_key=lambda _name: H3BundleSource(*_bundle_args()),
+    )
     nodes.UNETLoader.load_unet = load_unet
 
     # ComfyUI skips built-in combo membership validation for arguments named
