@@ -16,6 +16,7 @@ import comfy.utils
 import comfy.ldm.minimax.model as h3_model
 
 from .h3_bundle_source import BundleFileError, H3BundleSource
+from .h3_bundle_lora import H3BundleModelPatcher, install_lora_key_bridge
 from .h3_tensor_parallel import attach, supports
 
 logger = logging.getLogger('MultiGPU')
@@ -80,7 +81,9 @@ def load_h3_bundle(bundle_directory, pieces_directory, manifest_sha256):
         model_config.supported_inference_dtypes)
     model_config.set_inference_dtype(dtype,manual_cast,device=load_device)
     model = model_config.get_model(converted, '')
-    patcher = comfy.model_patcher.CoreModelPatcher(model,load_device=load_device,
+    install_lora_key_bridge()
+    model._mmh3_bundle_virtual_lora = True
+    patcher = H3BundleModelPatcher(model,load_device=load_device,
         offload_device=offload_device,fast_disk=comfy.storage.state_dict_fast_disk(converted))
     if not comfy.model_management.is_device_cpu(offload_device):
         model.to(offload_device)

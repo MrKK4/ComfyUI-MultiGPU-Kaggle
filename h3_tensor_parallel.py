@@ -796,7 +796,12 @@ def _prepare_sampling(tp, executor, *args, **kwargs):
             if isinstance(getattr(tp, 'path', None), H3BundleSource) and not _complete(tp.shards, len(tp.blocks)):
                 raise RuntimeError('H3 bundle pieces are incomplete; refusing to sample')
             # The guider's patcher carries LoRAs added after the loader, including stacked adapters.
-            tp.set_lora(executor.class_obj.model_patcher.patches)
+            patcher = executor.class_obj.model_patcher
+            if isinstance(getattr(tp, 'path', None), H3BundleSource):
+                from .h3_bundle_lora import sampling_patches
+                tp.set_lora(sampling_patches(patcher))
+            else:
+                tp.set_lora(patcher.patches)
             return executor(*args, **kwargs)
         finally:
             tp.release()  # ~0.6 GB of receive buffers per card and ~1.2 GB pinned host per token count
