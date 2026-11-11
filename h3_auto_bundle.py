@@ -1,9 +1,8 @@
-"""Notebook opt-in: route H3 loaders to the Olivia bundle and free managed VRAM."""
+"""Notebook opt-in: expose one Olivia bundle choice and free managed VRAM."""
 
 import logging
 import math
 import os
-import re
 from types import SimpleNamespace
 
 import torch
@@ -13,12 +12,7 @@ from .h3_bundle_source import H3BundleSource
 from . import h3_tensor_parallel
 
 logger = logging.getLogger('MultiGPU')
-_H3_NAME = re.compile(r'h3|minimax|prism|eros|singularity|olivia|dmad|pdmd', re.I)
 _INSTALLED = False
-
-
-def _is_h3_name(name):
-    return isinstance(name, str) and bool(_H3_NAME.search(name)) and name.lower().endswith('.safetensors')
 
 
 def _bundle_args():
@@ -51,22 +45,25 @@ def install():
     import nodes
     import comfy.model_management as mm
 
-    aliases = tuple(name.strip() for name in os.environ.get('MMH3_TP_BUNDLE_ALIASES', '').split('|')
-                    if name.strip())
-    if not aliases or not all(_is_h3_name(name) for name in aliases):
-        raise RuntimeError('H3 notebook needs a list of H3 checkpoint aliases')
+    bundle_name = os.environ.get('MMH3_TP_BUNDLE_NAME', '').strip()
+    if not bundle_name or '/' in bundle_name or '\\' in bundle_name or not bundle_name.endswith('.safetensors'):
+        raise RuntimeError('H3 notebook needs one virtual Olivia bundle filename')
+    def is_bundle_name(name):
+        return name == bundle_name
 
     original_list = folder_paths.get_filename_list
+    if bundle_name in original_list('diffusion_models'):
+        raise RuntimeError('H3 bundle choice conflicts with an installed diffusion model: ' + bundle_name)
     def filename_list(category):
         names = original_list(category)
         if category != 'diffusion_models':
             return names
-        return sorted(set(names).union(aliases))
+        return sorted(set(names).union((bundle_name,)))
     folder_paths.get_filename_list = filename_list
 
     original_unet_load = nodes.UNETLoader.load_unet
     def load_unet(self, unet_name, weight_dtype):
-        if not _is_h3_name(unet_name):
+        if not is_bundle_name(unet_name):
             return original_unet_load(self, unet_name, weight_dtype)
         if weight_dtype != 'default':
             raise ValueError('H3 split bundle uses its pinned int8 dtype; set weight_dtype to default')
@@ -75,7 +72,7 @@ def install():
     # Comfy Remote wraps this loader later. Give it the actual routing predicate
     # and bundle identity so it can preserve only this bundle's warm shards.
     load_unet.__mmh3_bundle_router__ = SimpleNamespace(
-        is_routed=_is_h3_name,
+        is_routed=is_bundle_name,
         bundle_key=lambda _name: H3BundleSource(*_bundle_args()),
     )
     nodes.UNETLoader.load_unet = load_unet
@@ -85,14 +82,14 @@ def install():
     # absent locally to reach the bundle route, while keeping ordinary names
     # subject to the normal file list.
     def validate_unet_name(unet_name):
-        if _is_h3_name(unet_name):
+        if is_bundle_name(unet_name):
             return True
         return unet_name in original_list('diffusion_models') or 'Model file is unavailable'
     nodes.UNETLoader.VALIDATE_INPUTS = staticmethod(validate_unet_name)
 
     original_tp_load = h3_tensor_parallel.UNETLoaderH3TensorParallel.load
     def load_tp(self, unet_name):
-        if not _is_h3_name(unet_name):
+        if not is_bundle_name(unet_name):
             return original_tp_load(self, unet_name)
         logger.info('[TP-BUNDLE-AUTO] %s -> Olivia split bundle (TP loader)', unet_name)
         return (load_h3_bundle(*_bundle_args()),)
@@ -127,5 +124,5 @@ def install():
     mm.free_memory = free_memory
 
     _INSTALLED = True
-    logger.info('[TP-BUNDLE-AUTO] enabled for H3 notebook; %d visible checkpoint aliases', len(aliases))
+    logger.info('[TP-BUNDLE-AUTO] Olivia bundle choice: %s; other checkpoints load their own weights', bundle_name)
     return True

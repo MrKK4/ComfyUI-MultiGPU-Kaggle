@@ -42,7 +42,7 @@ class AutoBundleTests(unittest.TestCase):
         package.h3_tensor_parallel = parallel
 
         paths = module('folder_paths')
-        paths.get_filename_list = lambda category: ['plain.safetensors'] if category == 'diffusion_models' else []
+        paths.get_filename_list = lambda category: ['plain.safetensors', 'Minimax-h3_Singularity_ref2va_v2_pruned_int8.safetensors'] if category == 'diffusion_models' else []
         nodes = module('nodes')
         nodes.UNETLoader = type('UNETLoader', (), {
             'load_unet': lambda self, name, dtype: ('ordinary', name, dtype)})
@@ -63,26 +63,31 @@ class AutoBundleTests(unittest.TestCase):
     def test_h3_loader_routing_and_other_models(self):
         env = {'MMH3_TP_BUNDLE_AUTO': '1', 'MMH3_TP_BUNDLE_DIR': 'bundle',
                'MMH3_TP_PIECES_DIR': 'pieces', 'MMH3_TP_BUNDLE_MANIFEST_SHA256': 'a' * 64,
-               'MMH3_TP_BUNDLE_ALIASES': 'PRISM_DMAD_PDMD_int8.safetensors|Olivia_H3.safetensors'}
+               'MMH3_TP_BUNDLE_NAME': 'Olivia_H3_split_bundle.safetensors'}
         with patch.dict(os.environ, env), patch.object(torch.cuda, 'device_count', return_value=2):
             self.assertTrue(self.auto.install())
             router = self.nodes.UNETLoader.load_unet.__mmh3_bundle_router__
-            self.assertTrue(router.is_routed('PRISM_DMAD_PDMD_int8.safetensors'))
+            self.assertTrue(router.is_routed('Olivia_H3_split_bundle.safetensors'))
             self.assertFalse(router.is_routed('plain.safetensors'))
-            self.assertEqual(router.bundle_key('PRISM_DMAD_PDMD_int8.safetensors').args,
+            self.assertFalse(router.is_routed('Minimax-h3_Singularity_ref2va_v2_pruned_int8.safetensors'))
+            self.assertEqual(router.bundle_key('Olivia_H3_split_bundle.safetensors').args,
                              ('bundle', 'pieces', 'a' * 64))
-            self.assertIn('PRISM_DMAD_PDMD_int8.safetensors', self.paths.get_filename_list('diffusion_models'))
-            self.assertEqual(self.nodes.UNETLoader().load_unet('PRISM_DMAD_PDMD_int8.safetensors', 'default')[0][0], 'bundle')
-            self.assertEqual(self.parallel.UNETLoaderH3TensorParallel().load('Olivia_H3.safetensors')[0][0], 'bundle')
+            self.assertIn('Olivia_H3_split_bundle.safetensors', self.paths.get_filename_list('diffusion_models'))
+            self.assertNotIn('PRISM_DMAD_PDMD_int8.safetensors', self.paths.get_filename_list('diffusion_models'))
+            self.assertEqual(self.nodes.UNETLoader().load_unet('Olivia_H3_split_bundle.safetensors', 'default')[0][0], 'bundle')
+            self.assertEqual(self.parallel.UNETLoaderH3TensorParallel().load('Olivia_H3_split_bundle.safetensors')[0][0], 'bundle')
             self.assertEqual(self.nodes.UNETLoader().load_unet('plain.safetensors', 'default')[0], 'ordinary')
-            self.assertTrue(self.nodes.UNETLoader.VALIDATE_INPUTS('Unknown_Minimax_H3.safetensors'))
+            self.assertEqual(self.nodes.UNETLoader().load_unet('Minimax-h3_Singularity_ref2va_v2_pruned_int8.safetensors', 'default')[0], 'ordinary')
+            self.assertEqual(self.parallel.UNETLoaderH3TensorParallel().load('Minimax-h3_Singularity_ref2va_v2_pruned_int8.safetensors')[0], 'ordinary TP')
+            self.assertFalse(self.nodes.UNETLoader.VALIDATE_INPUTS('Unknown_Minimax_H3.safetensors') is True)
+            self.assertTrue(self.nodes.UNETLoader.VALIDATE_INPUTS('Minimax-h3_Singularity_ref2va_v2_pruned_int8.safetensors'))
             with self.assertRaisesRegex(ValueError, 'default'):
-                self.nodes.UNETLoader().load_unet('PRISM_DMAD_PDMD_int8.safetensors', 'fp8_e5m2')
+                self.nodes.UNETLoader().load_unet('Olivia_H3_split_bundle.safetensors', 'fp8_e5m2')
 
     def test_managed_request_evicts_only_requested_gpu_and_skips_sample_lease(self):
         env = {'MMH3_TP_BUNDLE_AUTO': '1', 'MMH3_TP_BUNDLE_DIR': 'bundle',
                'MMH3_TP_PIECES_DIR': 'pieces', 'MMH3_TP_BUNDLE_MANIFEST_SHA256': 'a' * 64,
-               'MMH3_TP_BUNDLE_ALIASES': 'Olivia_H3.safetensors'}
+               'MMH3_TP_BUNDLE_NAME': 'Olivia_H3_split_bundle.safetensors'}
         with patch.dict(os.environ, env), patch.object(torch.cuda, 'device_count', return_value=2):
             self.auto.install()
             source = self.auto.H3BundleSource()
