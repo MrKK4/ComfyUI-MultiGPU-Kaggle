@@ -268,6 +268,89 @@ def _restore_rank(rank, device, pieces, root, source_sha, n_blocks):
 def restore_ranks(source_path, n_blocks, directory, manifest_sha256, cached, devices, free_memory, get_free_memory):
     started = time.perf_counter()
     root,manifest = validate_manifest(directory,source_path,n_blocks,manifest_sha256)
+    return _restore_validated(root,manifest,n_blocks,cached,devices,free_memory,get_free_memory,started)
+
+
+def restore_bundle_ranks(bundle_source, n_blocks, cached, devices, free_memory, get_free_memory):
+    """Use the same bounded shard reader with bundle metadata replacing the full source file."""
+    started = time.perf_counter()
+    manifest, _, _ = bundle_source.validate()
+    if n_blocks != manifest['n_blocks']:
+        raise PieceFileError('Bundle block count differs from model')
+    legacy = json.loads((bundle_source.pieces_directory/manifest['pieces_reference']['manifest']['file']).read_text(encoding='utf-8'))
+    legacy['_validation_seconds'] = time.perf_counter()-started
+    legacy['_source_sha_seconds'] = 0.0
+    legacy['_source_sha_cached'] = True
+    return _restore_bundle_missing(bundle_source.pieces_directory,legacy,n_blocks,cached,devices,
+                                   free_memory,get_free_memory,started)
+
+
+def _restore_bundle_missing(root, manifest, n_blocks, cached, devices, free_memory, get_free_memory, started):
+    """Stage missing pieces, then publish them together into the shared rank lists."""
+    ranks = cached if cached is not None else [None, None]
+    selected = {}
+    for rank in range(2):
+        blocks = ranks[rank]
+        if blocks is not None and len(blocks) != n_blocks:
+            raise PieceFileError('Cached H3 rank has the wrong block count')
+        selected[rank] = [p for p in manifest['pieces'] if p['rank'] == rank and
+                          (blocks is None or any(blocks[i] is None for i in range(p['block_start'], p['block_end'])))]
+        selected[rank].sort(key=lambda p:p['block_start'])
+        if selected[rank]:
+            needed = sum(p['resident_bytes'] for p in selected[rank]) + (1 << 30)
+            free_memory(needed, devices[rank])
+            available = get_free_memory(devices[rank])
+            if available < needed:
+                raise RuntimeError(f'[TP-PIECES] cuda rank {rank}: need {needed/2**30:.2f} GiB free, have {available/2**30:.2f} GiB')
+    missing = [rank for rank in range(2) if selected[rank]]
+    if not missing:
+        return ranks
+    caller_inference_mode = torch.is_inference_mode_enabled()
+
+    @torch.inference_mode(caller_inference_mode)
+    def worker(rank):
+        device = torch.device(devices[rank])
+        if device.type == 'cuda':
+            with torch.cuda.device(device):
+                return _restore_rank(rank,device,selected[rank],root,manifest['source']['sha256'],n_blocks)
+        return _restore_rank(rank,device,selected[rank],root,manifest['source']['sha256'],n_blocks)
+
+    completed, failures = [], []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(worker,rank) for rank in missing]
+        for rank, future in zip(missing, futures):
+            try:
+                completed.append((rank,*future.result()))
+            except BaseException as error:
+                failures.append(error)
+    file_errors = [error for _,_,error,_ in completed if error]
+    if failures or file_errors:
+        completed.clear()
+        futures.clear()
+        gc.collect()
+        for rank in missing:
+            if torch.device(devices[rank]).type == 'cuda':
+                with torch.cuda.device(devices[rank]):
+                    torch.cuda.synchronize(devices[rank])
+                    torch.cuda.empty_cache()
+        if failures:
+            raise failures[0]
+        raise PieceFileError('; '.join(file_errors))
+    # Keep rank and top-level list identities: all H3 instances borrow these lists.
+    for rank, blocks, _, timing in completed:
+        if ranks[rank] is None:
+            ranks[rank] = [None]*n_blocks
+        for piece in selected[rank]:
+            for index in range(piece['block_start'],piece['block_end']):
+                ranks[rank][index] = blocks[index]
+        logger.info('[TP-PIECES] restored rank=%d files=%d read_hash=%.3fs h2d=%.3fs',
+                    rank,timing['pieces'],timing['read_hash_seconds'],timing['h2d_seconds'])
+    logger.info('[TP-PIECES] restored %d pieces in %.3fs',
+                sum(len(selected[r]) for r in missing),time.perf_counter()-started)
+    return ranks
+
+
+def _restore_validated(root, manifest, n_blocks, cached, devices, free_memory, get_free_memory, started):
     missing = [rank for rank in range(2) if cached is None or cached[rank] is None]
     pieces = {rank:sorted((p for p in manifest['pieces'] if p['rank']==rank),key=lambda p:p['block_start']) for rank in missing}
     for rank in missing:

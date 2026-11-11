@@ -12,7 +12,9 @@ ns={'torch':types.SimpleNamespace(float16=np.float16,empty=lambda shape,**kw:np.
         is_tensor=lambda x:isinstance(x,np.ndarray),cuda=types.SimpleNamespace(synchronize=lambda d:None,
         empty_cache=lambda:None,device=lambda d:__import__('contextlib').nullcontext())),
     'DEVICES':(0,1),'_SHARD_CACHE':{},'logger':logging.getLogger('test'),'QKV_ROWS':4096,
-    'LORA_MODE':'auto','os':os,'PROFILE_FLAG':'__nonexistent_h3_test_flag__'}
+    'LORA_MODE':'auto','os':os,'PROFILE_FLAG':'__nonexistent_h3_test_flag__',
+    'H3BundleSource':type('H3BundleSource',(),{}),
+    'bundle_sampler_lease':lambda tp:__import__('contextlib').nullcontext()}
 ns['LORA_TARGETS']=("attn.qkv_proj","attn.out_proj","mlp.fc1","mlp.fc2")
 exec(compile(ast.Module(body=[n for n in tree.body if (isinstance(n,ast.ClassDef) and n.name=='H3TensorParallel')
     or (isinstance(n,ast.FunctionDef) and n.name in ('_no_block_prefetch','_prepare_sampling'))],type_ignores=[]),'h3-methods','exec'),ns)

@@ -93,6 +93,10 @@ def reference_builder(reference):
     module = ast.fix_missing_locations(CPUContext().visit(ast.Module(body=functions, type_ignores=[])))
     namespace = dict(torch=torch, json=json, time=time, contextlib=contextlib, HEAD=128,
                      DEVICES=(torch.device('cpu'), torch.device('cpu')), _SHARD_CACHE={},
+                     _complete=lambda cached, count: cached is not None and len(cached) == 2 and all(
+                         rank is not None and len(rank) == count and all(block is not None for block in rank)
+                         for rank in cached),
+                     H3BundleSource=type('H3BundleSource', (), {}),
                      open_weights=lambda window: window, logger=logging.getLogger('h3-export'),
                      comfy=types.SimpleNamespace(model_management=types.SimpleNamespace(free_memory=lambda *args: None)))
     exec(compile(module, str(reference), 'exec'), namespace)

@@ -16,12 +16,15 @@ import json
 import logging
 import os
 import time
+import threading
+from contextlib import contextmanager, nullcontext
 from collections import defaultdict
 
 import torch
 from safetensors import safe_open
 
 from .tp_source import open_weights
+from .h3_bundle_source import H3BundleSource
 
 import comfy.cli_args
 import comfy.model_management
@@ -42,6 +45,90 @@ S = 64.0
 HEAD = 128
 DEVICES = (torch.device("cuda:0"), torch.device("cuda:1"))
 _SHARD_CACHE = {}
+_BUNDLE_LOCKS = {}
+_BUNDLE_LEASES = defaultdict(int)
+
+
+def _bundle_lock(source):
+    return _BUNDLE_LOCKS.setdefault(source, threading.RLock())
+
+
+def _complete(shards, n_blocks):
+    return (shards is not None and len(shards) == 2 and
+            all(rank is not None and len(rank) == n_blocks and all(block is not None for block in rank)
+                for rank in shards))
+
+
+@contextmanager
+def bundle_sampler_lease(tp):
+    """Serialize sampling against piece eviction for source-free H3 bundles."""
+    if not isinstance(tp.path, H3BundleSource):
+        yield
+        return
+    lock = _bundle_lock(tp.path)
+    with lock:
+        _BUNDLE_LEASES[tp.path] += 1
+        try:
+            yield
+        finally:
+            _BUNDLE_LEASES[tp.path] -= 1
+
+
+def evict_bundle(model, free_gib_by_rank):
+    """Free the fewest whole pieces needed to reach each device's free-VRAM target."""
+    dm = getattr(getattr(model, 'model', None), 'diffusion_model', None)
+    tp = getattr(dm, '_mgpu_tp', None)
+    if tp is None or not isinstance(tp.path, H3BundleSource):
+        raise ValueError('TPEvictH3 requires a model from UNETLoaderH3TPBundle')
+    return evict_bundle_tp(tp, free_gib_by_rank)
+
+
+def evict_bundle_tp(tp, free_gib_by_rank):
+    """Evict from a known bundle instance, for both explicit and automatic barriers."""
+    if not isinstance(tp.path, H3BundleSource):
+        raise ValueError('Expected a source-free H3 bundle instance')
+    source = tp.path
+    targets = tuple(max(0, int(float(value)*(1 << 30))) for value in free_gib_by_rank)
+    if len(targets) != 2:
+        raise ValueError('Expected one free-VRAM target per GPU')
+    with _bundle_lock(source):
+        if _BUNDLE_LEASES[source]:
+            raise RuntimeError('Cannot evict H3 pieces while sampling')
+        shards = _SHARD_CACHE.get(source)
+        if shards is None:
+            return (0, 0)
+        manifest = getattr(tp, 'bundle_manifest', None)
+        if manifest is None:
+            manifest, _, _ = source.validate()
+        tp.release()  # exchange and LoRA scratch can hold GPU memory
+        released = [0, 0]
+        for rank, device in enumerate(DEVICES):
+            if not targets[rank] or shards[rank] is None:
+                continue
+            with torch.cuda.device(device):
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()
+                free, _ = torch.cuda.mem_get_info(device)
+                pieces = sorted((p for p in manifest['pieces'] if p['rank'] == rank),
+                                key=lambda p:p['block_start'], reverse=True)
+                for piece in pieces:
+                    if free >= targets[rank]:
+                        break
+                    a, b = piece['block_start'], piece['block_end']
+                    if all(shards[rank][i] is None for i in range(a,b)):
+                        continue
+                    for i in range(a,b):
+                        shards[rank][i] = None
+                    released[rank] += 1
+                    free += piece['resident_bytes']
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()
+                actual, _ = torch.cuda.mem_get_info(device)
+                if actual < targets[rank]:
+                    raise RuntimeError(f'[TP-STATE] GPU{rank} free {actual/2**30:.2f} GiB, need {targets[rank]/2**30:.2f} GiB; lower the requested memory or release other models')
+                logger.info('[TP-STATE] GPU%d free=%.2fGiB evicted=%d pieces',
+                            rank,actual/2**30,released[rank])
+        return tuple(released)
 CHUNKS = max(1, int(os.environ.get("MMH3_TP_CHUNKS", "4")))
 # Timing aid: with XCHG_OFF (env MULTIGPU_TP_XCHG_OFF=1, or set the module attribute at run time) the partial sums are not exchanged. The output is wrong; the step time
 # shows what the exchange costs.
@@ -244,10 +331,16 @@ def _rows(t, chunk, part, rank):
 
 def _load_shards(path, n_blocks):
     cached = _SHARD_CACHE.get(path)
-    if cached is not None and all(rank is not None for rank in cached):
+    if _complete(cached, n_blocks):
         logger.info('[MultiGPU TP] reusing both resident shard ranks')
         return cached
     missing = [rank for rank in range(len(DEVICES)) if cached is None or cached[rank] is None]
+    if isinstance(path, H3BundleSource):
+        from .h3_piece_loader import restore_bundle_ranks
+        shards = restore_bundle_ranks(path, n_blocks, cached, DEVICES,
+            comfy.model_management.free_memory, comfy.model_management.get_free_memory)
+        _SHARD_CACHE[path] = shards
+        return shards
     if isinstance(path, str) and os.environ.get('MMH3_TP_PIECES', '0') == '1':
         from .h3_piece_loader import PieceFileError, restore_ranks
         failure = None
@@ -369,14 +462,18 @@ def release_encoder_rank(device):
     rank = DEVICES.index(torch.device(device))
     released = 0
     for tp in _INSTANCES.values():
-        if tp.shards is None or tp.shards[rank] is None:
-            continue
-        tp.release()  # drop exchange/LoRA scratch without dropping weights
-        tp.shards[rank] = None
-        cached = _SHARD_CACHE.get(tp.path)
-        if cached is not None:
-            cached[rank] = None
-        released += 1
+        guard = _bundle_lock(tp.path) if isinstance(tp.path, H3BundleSource) else nullcontext()
+        with guard:
+            if isinstance(tp.path, H3BundleSource) and _BUNDLE_LEASES[tp.path]:
+                raise RuntimeError('Cannot release H3 encoder rank while sampling')
+            if tp.shards is None or tp.shards[rank] is None:
+                continue
+            tp.release()  # drop exchange/LoRA scratch without dropping weights
+            tp.shards[rank] = None
+            cached = _SHARD_CACHE.get(tp.path)
+            if cached is not None:
+                cached[rank] = None
+            released += 1
     with torch.cuda.device(DEVICES[rank]):
         torch.cuda.synchronize(DEVICES[rank])
         torch.cuda.empty_cache()
@@ -386,6 +483,8 @@ def release_encoder_rank(device):
 
 class H3TensorParallel:
     def release(self, drop_shards=False):
+        if drop_shards and isinstance(self.path, H3BundleSource) and _BUNDLE_LEASES[self.path]:
+            raise RuntimeError('Cannot drop H3 bundle shards while sampling')
         for d in DEVICES:
             torch.cuda.synchronize(d)
         self.xchg.bufs.clear()
@@ -410,7 +509,10 @@ class H3TensorParallel:
         blk = self.blocks[0]
         self.eps1, self.eps2 = blk.norm1.eps, blk.norm2.eps
         self.qk_eps = blk.attn.q_norm.eps
-        self.checked = os.environ.get("MMH3_TP_CHECK", "0") != "1"
+        requested_reference_check = os.environ.get("MMH3_TP_CHECK", "0") == "1"
+        self.checked = not requested_reference_check or isinstance(path, H3BundleSource)
+        if requested_reference_check and isinstance(path, H3BundleSource):
+            logger.info('[TP-BUNDLE] skipping original-block reference check; bundle owns only split projections')
         self.prefetch_oom_n = float("inf")
         self.lora, self.lora_sig = None, ()
         self.lora_entries = {}
@@ -538,8 +640,8 @@ class H3TensorParallel:
 
     def block(self, i, args, original):
         d0, d1 = DEVICES
-        if self.shards is None or any(rank is None for rank in self.shards):
-            if os.environ.get('MMH3_TP_PIECES', '0') == '1' and isinstance(self.path, str):
+        if not _complete(self.shards, len(self.blocks)):
+            if isinstance(self.path, H3BundleSource) or (os.environ.get('MMH3_TP_PIECES', '0') == '1' and isinstance(self.path, str)):
                 raise RuntimeError('H3 shards missing during forward; expected pre-sampling preload')
             # permanent allocations: keep them out of the compiler's per-forward allocation graph
             with comfy.model_prefetch.pause_malloc_graph(sync=True):
@@ -681,19 +783,23 @@ def _no_block_prefetch(executor, *args, **kwargs):
 def _prepare_sampling(tp, executor, *args, **kwargs):
     # models loaded earlier in the session (e.g. SAM 3.1 in the face swap workflow) stay on cuda:0, and ComfyUI
     # does not count the shards and TP activations it never allocated; unload them before the sampler loads
-    try:
-        # Text encoders and VAE helpers can be left on either card by preceding UI jobs.
-        for dev in DEVICES:
-            comfy.model_management.free_memory(1e30, dev)
-        if (os.environ.get('MMH3_TP_PIECES', '0') == '1' and isinstance(tp.path, str)
-                and (tp.shards is None or any(rank is None for rank in tp.shards))):
-            with comfy.model_prefetch.pause_malloc_graph(sync=True):
-                tp.shards = _load_shards(tp.path, len(tp.blocks))
-        # The guider's patcher carries LoRAs added after the loader, including stacked adapters.
-        tp.set_lora(executor.class_obj.model_patcher.patches)
-        return executor(*args, **kwargs)
-    finally:
-        tp.release()  # ~0.6 GB of receive buffers per card and ~1.2 GB pinned host per token count
+    with bundle_sampler_lease(tp):
+        try:
+            # Text encoders and VAE helpers can be left on either card by preceding UI jobs.
+            for dev in DEVICES:
+                comfy.model_management.free_memory(1e30, dev)
+            if ((isinstance(getattr(tp, 'path', None), H3BundleSource) or
+                 (os.environ.get('MMH3_TP_PIECES', '0') == '1' and isinstance(getattr(tp, 'path', None), str)))
+                    and not _complete(tp.shards, len(tp.blocks))):
+                with comfy.model_prefetch.pause_malloc_graph(sync=True):
+                    tp.shards = _load_shards(tp.path, len(tp.blocks))
+            if isinstance(getattr(tp, 'path', None), H3BundleSource) and not _complete(tp.shards, len(tp.blocks)):
+                raise RuntimeError('H3 bundle pieces are incomplete; refusing to sample')
+            # The guider's patcher carries LoRAs added after the loader, including stacked adapters.
+            tp.set_lora(executor.class_obj.model_patcher.patches)
+            return executor(*args, **kwargs)
+        finally:
+            tp.release()  # ~0.6 GB of receive buffers per card and ~1.2 GB pinned host per token count
 
 
 class UNETLoaderH3TensorParallel:

@@ -19,6 +19,7 @@ import comfy.samplers
 
 from . import h3_tensor_parallel, krea2_tensor_parallel, ltx_tensor_parallel, qwen21_tensor_parallel
 from .tp_source import ModelWeights
+from .h3_bundle_source import H3BundleSource
 
 logger = logging.getLogger("MultiGPU")
 # (name, module, wrapper key its attach() uses)
@@ -55,7 +56,8 @@ def _drop(mod, key):
 def _build(tp, mod):
     """Shards now, before sampling, so a model the shard builder cannot read falls back to one GPU cleanly."""
     if hasattr(tp, "shards"):
-        if tp.shards is None:
+        if tp.shards is None or (isinstance(getattr(tp, 'path', None), H3BundleSource)
+                                 and not h3_tensor_parallel._complete(tp.shards, len(tp.blocks))):
             tp.shards = mod._load_shards(tp.path, len(tp.blocks))
     elif tp.gpu is None:
         tp._load()
@@ -108,10 +110,21 @@ _sample = comfy.samplers.CFGGuider.sample
 
 
 def sample(self, *args, **kwargs):
+    dm = getattr(getattr(self.model_patcher, 'model', None), 'diffusion_model', None)
+    bundled = getattr(dm, '_mgpu_tp', None)
+    is_bundle = isinstance(getattr(bundled, 'path', None), H3BundleSource)
     try:
-        attach(self.model_patcher)
+        tp = attach(self.model_patcher)
     except Exception:
+        if is_bundle:
+            raise  # source-free bundle cannot sample on one GPU
         logger.exception("[MultiGPU TP auto] could not attach tensor parallel; this run uses one GPU")
+        tp = None
+    if is_bundle and tp is not bundled:
+        raise RuntimeError('H3 bundle sampler attachment changed; refusing to sample')
+    if isinstance(getattr(tp, 'path', None), H3BundleSource):
+        with h3_tensor_parallel.bundle_sampler_lease(tp):
+            return _sample(self, *args, **kwargs)
     return _sample(self, *args, **kwargs)
 
 

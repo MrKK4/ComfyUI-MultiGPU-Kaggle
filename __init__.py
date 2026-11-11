@@ -24,6 +24,8 @@ from .ltx_block_capture import install_block_capture
 from .ltx_te_diag import install_te_diag
 from .ltx_tensor_parallel import UNETLoaderLTXTensorParallel
 from .h3_tensor_parallel import UNETLoaderH3TensorParallel
+from .h3_bundle_loader import UNETLoaderH3TPBundle
+from .h3_bundle_evict import TPEvictH3Image, TPEvictH3Latent
 from .krea2_tensor_parallel import UNETLoaderKrea2TensorParallel
 from .qwen21_tensor_parallel import UNETLoaderQwen21TensorParallel
 from .h3_dual_vae import VAEDecodeH3DualGPU, VAEEncodeH3DualGPU
@@ -833,6 +835,9 @@ register_and_count(["PuLID_ComfyUI", "pulid_comfyui"], pulid_nodes)
 register_and_count(["ComfyUI-WanVideoWrapper", "comfyui-wanvideowrapper"], _load_wanvideo_nodes)
 
 NODE_CLASS_MAPPINGS["UNETLoaderH3TensorParallel"] = UNETLoaderH3TensorParallel
+NODE_CLASS_MAPPINGS["UNETLoaderH3TPBundle"] = UNETLoaderH3TPBundle
+NODE_CLASS_MAPPINGS["TPEvictH3Image"] = TPEvictH3Image
+NODE_CLASS_MAPPINGS["TPEvictH3Latent"] = TPEvictH3Latent
 NODE_CLASS_MAPPINGS["VAEDecodeH3DualGPU"] = VAEDecodeH3DualGPU
 NODE_CLASS_MAPPINGS["VAEEncodeH3DualGPU"] = VAEEncodeH3DualGPU
 NODE_CLASS_MAPPINGS["VAEDecodeLTXDualGPU"] = VAEDecodeLTXDualGPU
@@ -847,6 +852,11 @@ NODE_CLASS_MAPPINGS.update(_trellis2_dual_nodes)
 # every supported model samples on both GPUs whatever loaded it (MULTIGPU_TP_AUTO=0 off)
 from .tp_auto import install as _install_tp_auto
 _install_tp_auto()
+
+# H3 notebook opt-in: existing H3 loader nodes use the pinned split bundle,
+# and ComfyUI-managed memory requests can evict its pieces before sampling.
+from .h3_auto_bundle import install as _install_h3_auto_bundle
+_install_h3_auto_bundle()
 
 for item in registration_data:
     logger.info(fmt_reg.format(item['name'], item['found'], str(item['count'])))

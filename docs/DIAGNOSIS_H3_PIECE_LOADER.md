@@ -44,9 +44,21 @@ The original-code diagnostic localizes extra reservation to block 0, which inclu
 
 The split loader itself peaks at approximately 8.99 GiB per GPU. Extra reserved memory during the first checked block explains the observed physical VRAM difference; it is not additional resident model bytes or a persistent live-tensor leak. Allocation order, allocator reuse and asynchronous reference-work lifetimes remain candidates for why that reservation differs. A specific fragmentation or backend cause has not yet been proven.
 
-Claude initially predicted that fixing inference mode would also remove the memory spike. The one-variable GPU test falsified that prediction. A follow-up review carries these counter-results. Do not increase the ceiling or skip the failing check to report a pass. A separate cold run with the normal production setting (`MMH3_TP_CHECK=0`) would distinguish reference-check overhead from the ordinary workflow's first-run budget; that run has not been performed here.
+Claude initially predicted that fixing inference mode would also remove the memory spike. The one-variable GPU test falsified that prediction. A follow-up review carried these counter-results. Do not increase the ceiling or skip the failing check to report a pass. The subsequent cold run with the normal production setting (`MMH3_TP_CHECK=0`) is reported separately below.
 
-The follow-up Opus 5.5 review (run 6561457, saved as `memory_senior_answer.md`) withdrew its compilation explanation and recommended controlled trim/order/production probes. These were submitted as `safd7sd4/h3-pieces-memory-probe`, version 1, and reached RUNNING immediately. Each case uses a fresh ComfyUI process. The trim and order cases retain the reference check; the production case is reported separately. The test-only order change is not in the production runtime. A hidden local monitor downloads the bounded diagnostic files into `diagnosis/memory_output_v1`; `diagnosis/memory_monitor_state.json` records its status. Results are pending at this checkpoint.
+The follow-up Opus 5.5 review (run 6561457, saved as `memory_senior_answer.md`) withdrew its compilation explanation and recommended controlled trim/order/production probes. `safd7sd4/h3-pieces-memory-probe`, version 1, completed all three cases in fresh ComfyUI processes. Every case reproduced baseline video/audio latents exactly, with no recompile-limit warning.
+
+| Controlled case | GPU0 NVML peak | GPU1 NVML peak | 1 GiB margin |
+| --- | ---: | ---: | --- |
+| Trim before block 0, CHECK=1 | 14.343 GiB | 11.890 GiB | Fail |
+| Load pieces after model load, CHECK=1 | 13.265 GiB | 11.856 GiB | Pass |
+| Existing preload order, normal CHECK=0 | 12.060 GiB | 11.856 GiB | Pass |
+
+The trim released about 0.31 GiB before the check but reserved memory grew again to 13.875 GiB **inside the reference calculation**. Worker and execution stream identifiers were all zero, ruling out the proposed worker/default-stream mismatch. Moving preload after model loading reduced post-reference reservation to 12.875 GiB. This demonstrates load-order sensitivity in the checked reference path and refutes the proposed simple trim fix. It does not identify a specific allocator implementation defect.
+
+Normal cold inference passes the margin for this workload without changing load order. The original CHECK=1 integration failure remains recorded; the production result is not substituted for it. The order change exists only in the diagnostic overlay and has not been adopted into the runtime. Any proposed load-order integration change should return to Claude with these measurements before implementation.
+
+Complete results are in `portkit_runs/h3_piece_loader/diagnosis/memory_output_v1/h3_up/memory_summary.json`. The background monitor saved the reports and stopped with `results_ready`.
 
 ## Measurements and scope
 
