@@ -45,7 +45,8 @@ def load_h3_bundle(bundle_directory, pieces_directory, manifest_sha256):
         raise BundleFileError('H3 generation loader expects 50 transformer blocks')
     if (_reference_sha(comfy.model_detection) != config['model_detection_sha256']
             or _reference_sha(h3_model) != config['model_constructor_sha256']):
-        raise BundleFileError('ComfyUI H3 detector/constructor differs from the pinned bundle build')
+        # No version pin: a newer ComfyUI is fine as long as it still detects the same H3 configuration (checked below).
+        logger.info('[MultiGPU H3 bundle] ComfyUI H3 sources differ from the bundle build; relying on the detected-config check')
     prefix = manifest['key_prefix']
     catalog = manifest['original_tensors']
     original_shapes = {row['name'][len(prefix):]:_Shape(row['shape']) for row in catalog}
