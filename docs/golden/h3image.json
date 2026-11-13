@@ -1,0 +1,16 @@
+{
+ "family": "MiniMax H3 Image (minimax_h3_image_pruned_int8_convrot, Comfy-Org/MiniMax-H3-Image)",
+ "module": "h3_tensor_parallel.py (no new code: MiniMaxH3ImageModel subclasses MiniMaxH3Model, same 50 blocks and shapes)",
+ "requires": "ComfyUI >= v0.45.0",
+ "run": "tsdrp34/h3-image-verify v1, 2026-11-13, ComfyUI 0.45.3, fork tag h3-bundle-choice-1, Kaggle 2x T4, harness mode kvi",
+ "job": "2048x2048 (4 MP), 4 steps euler/simple cfg 1, int4 text encoder, image VAE fp16",
+ "verdict": "PASS",
+ "block0_rel_err": 2.928e-3,
+ "step_s": {"warm_on": 3.34, "warm_exchange_off": 3.23, "exchange_share": 0.062},
+ "job_s": {"cold": 180.3, "warm": 20.2, "after_release": 118.3},
+ "shard_load_s": 76,
+ "peak_gib": {"cold": [10.72, 11.83], "warm": [10.89, 10.16]},
+ "resident_gib": [8.99, 8.99],
+ "release_gib_after": [0.01, 0.01],
+ "untested": ["sizes above 4 MP (model card recommends about 16 MP)", "image edit / reference images", "LoRA", "Olivia-style pre-split bundle for this model"]
+}
