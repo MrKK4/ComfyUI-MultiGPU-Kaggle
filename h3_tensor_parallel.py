@@ -61,10 +61,7 @@ def _complete(shards, n_blocks):
 
 @contextmanager
 def bundle_sampler_lease(tp):
-    """Serialize sampling against piece eviction for source-free H3 bundles."""
-    if not isinstance(tp.path, H3BundleSource):
-        yield
-        return
+    """Serialize sampling against shard eviction (bundle pieces or single blocks of a checkpoint)."""
     lock = _bundle_lock(tp.path)
     with lock:
         _BUNDLE_LEASES[tp.path] += 1
@@ -78,16 +75,20 @@ def evict_bundle(model, free_gib_by_rank):
     """Free the fewest whole pieces needed to reach each device's free-VRAM target."""
     dm = getattr(getattr(model, 'model', None), 'diffusion_model', None)
     tp = getattr(dm, '_mgpu_tp', None)
-    if tp is None or not isinstance(tp.path, H3BundleSource):
-        raise ValueError('TPEvictH3 requires a model from UNETLoaderH3TPBundle')
+    if tp is None:
+        raise ValueError('TPEvictH3 requires an H3 tensor-parallel model')
     return evict_bundle_tp(tp, free_gib_by_rank)
+
+
+def _shard_bytes(shard):
+    return sum(t.numel() * t.element_size() for v in shard.values()
+               for t in (v if isinstance(v, tuple) else (v,)) if torch.is_tensor(t))
 
 
 def evict_bundle_tp(tp, free_gib_by_rank):
     """Evict from a known bundle instance, for both explicit and automatic barriers."""
-    if not isinstance(tp.path, H3BundleSource):
-        raise ValueError('Expected a source-free H3 bundle instance')
     source = tp.path
+    bundle = isinstance(source, H3BundleSource)
     targets = tuple(max(0, int(float(value)*(1 << 30))) for value in free_gib_by_rank)
     if len(targets) != 2:
         raise ValueError('Expected one free-VRAM target per GPU')
@@ -98,7 +99,7 @@ def evict_bundle_tp(tp, free_gib_by_rank):
         if shards is None:
             return (0, 0)
         manifest = getattr(tp, 'bundle_manifest', None)
-        if manifest is None:
+        if manifest is None and bundle:
             manifest, _, _ = source.validate()
         tp.release()  # exchange and LoRA scratch can hold GPU memory
         released = [0, 0]
@@ -109,8 +110,12 @@ def evict_bundle_tp(tp, free_gib_by_rank):
                 torch.cuda.synchronize(device)
                 torch.cuda.empty_cache()
                 free, _ = torch.cuda.mem_get_info(device)
-                pieces = sorted((p for p in manifest['pieces'] if p['rank'] == rank),
-                                key=lambda p:p['block_start'], reverse=True)
+                if bundle:
+                    pieces = sorted((p for p in manifest['pieces'] if p['rank'] == rank),
+                                    key=lambda p:p['block_start'], reverse=True)
+                else:  # a checkpoint's shards are sliced per block, so one block is the eviction unit
+                    pieces = [{'block_start':i, 'block_end':i+1, 'resident_bytes':_shard_bytes(shards[rank][i])}
+                              for i in reversed(range(len(shards[rank]))) if shards[rank][i] is not None]
                 for piece in pieces:
                     if free >= targets[rank]:
                         break
@@ -355,8 +360,9 @@ def _load_shards(path, n_blocks):
             return shards
         logger.warning('[TP-PIECES] rejected: %s; rebuilding from original source', failure)
     started = time.perf_counter()
-    logger.info('[MultiGPU TP] loading shard ranks %s; retained ranks %s', missing,
-                [rank for rank in range(len(DEVICES)) if rank not in missing])
+    todo = [n_blocks if cached is None or cached[rank] is None else sum(block is None for block in cached[rank])
+            for rank in range(len(DEVICES))]
+    logger.info('[MultiGPU TP] loading shard blocks per rank: %s of %d', todo, n_blocks)
     with open_weights(path) as f:   # checkpoint path, or tp_source.ModelWeights of a loaded model
         layers = json.loads(f.metadata()["_quantization_metadata"])["layers"]
         need = 0
@@ -365,15 +371,16 @@ def _load_shards(path, n_blocks):
             if conf.get("format") != "int8_tensorwise" or not conf.get("convrot"):
                 raise ValueError(f"tensor parallel needs the int8 convrot checkpoint; blocks.0.{k} is {conf}")
             need += f.get_slice(f"blocks.0.{k}.weight").get_shape()[0] * f.get_slice(f"blocks.0.{k}.weight").get_shape()[1]
-        need = int(need * n_blocks / 2 * 1.08)
-        for rank in missing:
-            comfy.model_management.free_memory(need + (2 << 30), DEVICES[rank])
-        # Build into a separate list so a failed restore cannot expose a
-        # half-built rank through the persistent cache.
-        shards = list(cached) if cached is not None else [None, None]
-        for rank in missing:
-            shards[rank] = []
+        for rank, count in enumerate(todo):
+            if count:
+                comfy.model_management.free_memory(int(need * count / 2 * 1.08) + (2 << 30), DEVICES[rank])
+        # Build into separate lists so a failed restore cannot expose half-built ranks through the persistent cache.
+        # Only the missing blocks of a rank are read again (after a partial eviction).
+        shards = [list(r) if r is not None else [None] * n_blocks for r in (cached or [None, None])]
         for i in range(n_blocks):
+            missing = [rank for rank in range(len(DEVICES)) if shards[rank][i] is None]
+            if not missing:
+                continue
             p = f"blocks.{i}."
             g = lambda k: f.get_tensor(p + k)
             qkv, qkv_s, out, out_s = g("attn.qkv_proj.weight"), g("attn.qkv_proj.weight_scale"), g("attn.out_proj.weight"), g("attn.out_proj.weight_scale")
@@ -385,7 +392,7 @@ def _load_shards(path, n_blocks):
                 dev = DEVICES[rank]
                 with torch.cuda.device(dev):
                     half_i, half_f = inner // 2, ffn // 2
-                    shards[rank].append({
+                    shards[rank][i] = {
                         "heads": half_i // HEAD, "inner": half_i,
                         "qkv": (_rows(qkv, inner, half_i, rank).to(dev), _rows(qkv_s, inner, half_i, rank).to(dev)),
                         "out": (out[:, rank * half_i:(rank + 1) * half_i].contiguous().to(dev), out_s.to(dev)),
@@ -393,12 +400,12 @@ def _load_shards(path, n_blocks):
                         "fc2": (fc2[:, rank * half_f:(rank + 1) * half_f].contiguous().to(dev), fc2_s.to(dev)),
                         "norm1": small["norm1"].to(dev), "norm2": small["norm2"].to(dev),
                         "qn": qn.to(dev), "kn": kn.to(dev),
-                    })
+                    }
             if i % 10 == 0:
                 logger.info(f"[MultiGPU TP] sharded block {i}/{n_blocks}")
     _SHARD_CACHE[path] = shards
-    logger.info('[MultiGPU TP] %d blocks ready over %s; loaded ranks %s in %.2f seconds',
-                n_blocks, ', '.join(map(str, DEVICES)), missing, time.perf_counter()-started)
+    logger.info('[MultiGPU TP] %d blocks ready over %s; loaded blocks per rank %s in %.2f seconds',
+                n_blocks, ', '.join(map(str, DEVICES)), todo, time.perf_counter()-started)
     return shards
 
 
@@ -532,10 +539,10 @@ class H3TensorParallel:
             elif not name.startswith("adaln_proj"):  # adaln_proj also runs on the patched original module
                 ignored.append(key)
         sig = tuple(sorted((k, tuple((id(p[1]), p[0], p[2], id(p[3]), id(p[4])) for p in v)) for k, v in entries.items()))
+        if ignored:  # before the unchanged-signature return: an unsupported patch must never pass silently
+            raise ValueError("H3 tensor parallel cannot apply these block patches correctly: " + str(ignored[:5]))
         if sig == self.lora_sig:
             return
-        if ignored:
-            raise ValueError("H3 tensor parallel cannot apply these block patches correctly: " + str(ignored[:5]))
         self.lora = None
         # Construct one block at a time. Avoid duplicating every CPU adapter or allocating every GPU side path
         # before the base shards, activations and other workflow models have been accounted for.
@@ -838,6 +845,9 @@ def attach(model, source, key):
     # the Comfy compiler records one device's allocations per forward; TP allocates on two.
     # ponytail: process-wide, Split in the same session runs without the compiler
     comfy.cli_args.args.disable_comfy_compiler = True
+    if os.environ.get('MMH3_TP_AUTO_EVICT', '0') == '1':  # opt-in until measured: partial eviction for plain checkpoints
+        from .h3_auto_bundle import install_auto_evict
+        install_auto_evict()
     for other_key, other in _INSTANCES.items():
         if other_key != key and (other.shards is not None or other.lora is not None):
             other.release(drop_shards=True)

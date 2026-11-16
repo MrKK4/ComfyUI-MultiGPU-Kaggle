@@ -24,11 +24,9 @@ def _bundle_args():
 
 
 def _active_bundle():
-    active = [tp for tp in h3_tensor_parallel._INSTANCES.values()
-              if isinstance(getattr(tp, 'path', None), H3BundleSource)
-              and getattr(tp, 'shards', None) is not None]
+    active = [tp for tp in h3_tensor_parallel._INSTANCES.values() if getattr(tp, 'shards', None) is not None]
     if len(active) > 1:
-        raise RuntimeError('More than one H3 bundle is resident; automatic eviction is ambiguous')
+        raise RuntimeError('More than one H3 model is resident; automatic eviction is ambiguous')
     return active[0] if active else None
 
 
@@ -96,6 +94,24 @@ def install():
     h3_tensor_parallel.UNETLoaderH3TensorParallel.load = load_tp
     h3_tensor_parallel.UNETLoaderH3TensorParallel.VALIDATE_INPUTS = staticmethod(validate_unet_name)
 
+    install_auto_evict()
+    _INSTALLED = True
+    logger.info('[TP-BUNDLE-AUTO] Olivia bundle choice: %s; other checkpoints load their own weights', bundle_name)
+    return True
+
+
+_EVICT_INSTALLED = False
+
+
+def install_auto_evict():
+    """ComfyUI's managed memory requests free H3 shards (bundle pieces, or single blocks of a checkpoint) on the
+    card they need; the next sampling run reads only the missing ones again."""
+    global _EVICT_INSTALLED
+    if _EVICT_INSTALLED:
+        return
+    _EVICT_INSTALLED = True
+    import comfy.model_management as mm
+
     original_free = mm.free_memory
     def free_memory(memory_required, device, *args, **kwargs):
         result = original_free(memory_required, device, *args, **kwargs)
@@ -105,7 +121,11 @@ def install():
         rank = target_device.index if target_device.index is not None else torch.cuda.current_device()
         if rank not in (0, 1) or not math.isfinite(memory_required) or memory_required <= 0:
             return result
-        tp = _active_bundle()
+        try:
+            tp = _active_bundle()
+        except RuntimeError as error:  # automatic path: never turn another model's load into a failure
+            logger.warning('[TP-BUNDLE-AUTO] no eviction: %s', error)
+            return result
         if tp is None or h3_tensor_parallel._BUNDLE_LEASES[tp.path]:
             return result
         free, total = torch.cuda.mem_get_info(rank)
@@ -117,12 +137,12 @@ def install():
         if free < target:
             targets = [0.0, 0.0]
             targets[rank] = target / (1 << 30)
-            released = h3_tensor_parallel.evict_bundle_tp(tp, targets)
+            try:
+                released = h3_tensor_parallel.evict_bundle_tp(tp, targets)
+            except RuntimeError as error:  # pieces are freed already; let ComfyUI go on with what is free
+                logger.warning('[TP-BUNDLE-AUTO] GPU%d managed request %.2fGiB not fully met: %s', rank, memory_required / (1 << 30), error)
+                return result
             logger.info('[TP-BUNDLE-AUTO] GPU%d managed request %.2fGiB; evicted %d pieces',
                         rank, memory_required / (1 << 30), released[rank])
         return result
     mm.free_memory = free_memory
-
-    _INSTALLED = True
-    logger.info('[TP-BUNDLE-AUTO] Olivia bundle choice: %s; other checkpoints load their own weights', bundle_name)
-    return True
