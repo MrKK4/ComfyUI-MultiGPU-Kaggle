@@ -35,8 +35,13 @@ def _reference_sha(module):
         return hashlib.sha256(handle.read()).hexdigest()
 
 
-def load_h3_bundle(bundle_directory, pieces_directory, manifest_sha256):
+def load_h3_bundle(bundle_directory, pieces_directory, manifest_sha256, disable_dynamic=False):
     """Construct the ordinary H3 Comfy model from companion weights, then attach TP pieces."""
+    if disable_dynamic:
+        # ComfyUI asks for a second, statically loaded copy (TorchCompileModel, hook/scheduled LoRA, its own multi-GPU
+        # nodes). That copy would lose the projection LoRA handling, so refuse clearly instead of running wrong.
+        raise BundleFileError('The H3 split bundle cannot be used with TorchCompile, hook/scheduled LoRA or '
+                              'ComfyUI multi-GPU nodes; remove that node or load the plain checkpoint')
     if torch.cuda.device_count() < 2:
         raise RuntimeError('H3 TP bundle needs two CUDA devices')
     source = H3BundleSource(bundle_directory, pieces_directory, manifest_sha256)

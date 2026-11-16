@@ -383,20 +383,31 @@ def _load_shards(path, n_blocks):
                 continue
             p = f"blocks.{i}."
             g = lambda k: f.get_tensor(p + k)
-            qkv, qkv_s, out, out_s = g("attn.qkv_proj.weight"), g("attn.qkv_proj.weight_scale"), g("attn.out_proj.weight"), g("attn.out_proj.weight_scale")
-            fc1, fc1_s, fc2, fc2_s = g("mlp.fc1.weight"), g("mlp.fc1.weight_scale"), g("mlp.fc2.weight"), g("mlp.fc2.weight_scale")
+            # One rank of a checkpoint file: read only that rank's rows of the column-parallel weights (half the bytes).
+            one = missing[0] if len(missing) == 1 and isinstance(path, str) else None
+            inner, ffn = f.get_slice(p + "attn.qkv_proj.weight").get_shape()[0] // 3, f.get_slice(p + "mlp.fc1.weight").get_shape()[0] // 2
+
+            def col(k, chunk):
+                if one is None:
+                    return g(k)
+                s, part = f.get_slice(p + k), chunk // 2
+                return torch.cat([s[j * chunk + one * part: j * chunk + (one + 1) * part] for j in range(s.get_shape()[0] // chunk)])
+
+            def mine(t, chunk, rank):   # rows of `rank`: already cut when read sliced
+                return t if one is not None else _rows(t, chunk, chunk // 2, rank)
+            qkv, qkv_s, out, out_s = col("attn.qkv_proj.weight", inner), col("attn.qkv_proj.weight_scale", inner), g("attn.out_proj.weight"), g("attn.out_proj.weight_scale")
+            fc1, fc1_s, fc2, fc2_s = col("mlp.fc1.weight", ffn), col("mlp.fc1.weight_scale", ffn), g("mlp.fc2.weight"), g("mlp.fc2.weight_scale")
             small = {n: g(k).float() for n, k in (("norm1", "norm1.weight"), ("norm2", "norm2.weight"))}
             qn, kn = g("attn.q_norm.weight"), g("attn.k_norm.weight")
-            inner, ffn = qkv.shape[0] // 3, fc1.shape[0] // 2
             for rank in missing:
                 dev = DEVICES[rank]
                 with torch.cuda.device(dev):
                     half_i, half_f = inner // 2, ffn // 2
                     shards[rank][i] = {
                         "heads": half_i // HEAD, "inner": half_i,
-                        "qkv": (_rows(qkv, inner, half_i, rank).to(dev), _rows(qkv_s, inner, half_i, rank).to(dev)),
+                        "qkv": (mine(qkv, inner, rank).to(dev), mine(qkv_s, inner, rank).to(dev)),
                         "out": (out[:, rank * half_i:(rank + 1) * half_i].contiguous().to(dev), out_s.to(dev)),
-                        "fc1": (_rows(fc1, ffn, half_f, rank).to(dev), _rows(fc1_s, ffn, half_f, rank).to(dev)),
+                        "fc1": (mine(fc1, ffn, rank).to(dev), mine(fc1_s, ffn, rank).to(dev)),
                         "fc2": (fc2[:, rank * half_f:(rank + 1) * half_f].contiguous().to(dev), fc2_s.to(dev)),
                         "norm1": small["norm1"].to(dev), "norm2": small["norm2"].to(dev),
                         "qn": qn.to(dev), "kn": kn.to(dev),
