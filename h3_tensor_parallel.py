@@ -328,6 +328,11 @@ def _rows(t, chunk, part, rank):
 
 
 def _load_shards(path, n_blocks):
+    with _bundle_lock(path):   # a job that starts during the startup preload waits for it instead of loading twice
+        return _load_shards_locked(path, n_blocks)
+
+
+def _load_shards_locked(path, n_blocks):
     cached = _SHARD_CACHE.get(path)
     if _complete(cached, n_blocks):
         logger.info('[MultiGPU TP] reusing both resident shard ranks')
@@ -791,7 +796,8 @@ class UNETLoaderH3TensorParallel:
     def load(self, unet_name):
         if torch.cuda.device_count() < 2:
             raise RuntimeError("H3 tensor parallel needs two CUDA devices")
-        path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+        # real path: a workflow that names a link to this file (e.g. the old bundle name) reuses the same shards
+        path = os.path.realpath(folder_paths.get_full_path_or_raise("diffusion_models", unet_name))
         model = comfy.sd.load_diffusion_model(path)
         if not supports(model.model.diffusion_model):
             raise ValueError("UNETLoaderH3TensorParallel only supports MiniMax H3 checkpoints")
@@ -852,6 +858,28 @@ def install_auto_evict():
                         rank, memory_required / (1 << 30), released[rank])
         return result
     mm.free_memory = free_memory
+
+
+def preload(name):
+    """Notebook start (MMH3_TP_PRELOAD): shard diffusion_models/`name` in the background as soon as the file exists,
+    so the first job finds both GPUs ready. Right after its download the file is mostly still in the page cache."""
+    def run():
+        try:
+            while folder_paths.get_full_path('diffusion_models', name) is None:   # still downloading
+                time.sleep(10)
+            key = os.path.realpath(folder_paths.get_full_path('diffusion_models', name))
+            started = time.perf_counter()
+            with _bundle_lock(key):
+                if _complete(_SHARD_CACHE.get(key), 50):
+                    return
+                UNETLoaderH3TensorParallel().load(name)
+                tp = _INSTANCES[key]
+                tp.shards = _load_shards(key, len(tp.blocks))
+            logger.info('[MultiGPU TP] preloaded %s on both GPUs in %.1f s', name, time.perf_counter() - started)
+        except Exception as error:   # the first job loads it the normal way
+            logger.warning('[MultiGPU TP] preload of %s failed: %s: %s', name, type(error).__name__, error)
+    if torch.cuda.device_count() >= 2:
+        threading.Thread(target=run, name='mmh3-preload', daemon=True).start()
 
 
 def supports(dm):

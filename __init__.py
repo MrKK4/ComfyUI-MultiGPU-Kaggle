@@ -859,3 +859,6 @@ for item in registration_data:
 logger.info(dash_line)
 
 logger.info(f"[MultiGPU] Registration complete. Final mappings: {', '.join(NODE_CLASS_MAPPINGS.keys())}")
+if os.environ.get("MMH3_TP_PRELOAD"):
+    from .h3_tensor_parallel import preload as _mmh3_preload
+    _mmh3_preload(os.environ["MMH3_TP_PRELOAD"])
